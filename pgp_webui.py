@@ -128,6 +128,17 @@ def list_secret_keys():
     out, err, code = run_gpg(['--list-secret-keys'])
     return out
 
+def import_public_key(key_data: str) -> tuple[str, int]:
+    """Import a public key block. Returns (output, returncode)."""
+    tmp = app.config['PGP_DIR'] / f'.tmp_import_{int(time.time())}.asc'
+    tmp.write_text(key_data.strip())
+    out, err, code = run_gpg(['--import', str(tmp)])
+    try:
+        tmp.unlink()
+    except Exception:
+        pass
+    return out, code
+
 def gpg_agent_status():
     out, err, code = run_gpg(['--list-keys'])
     return 'running' if code == 0 else 'stopped'
@@ -283,6 +294,7 @@ def base_template(title, active_tab, dark_mode=True):
         ('compose', 'Compose'),
         ('inbox', 'Inbox'),
         ('sent', 'Sent Log'),
+        ('keys_page', 'Keys'),
         ('settings_page', 'Settings'),
     ]
     tabs_html = ''.join(
@@ -323,7 +335,6 @@ def compose():
     keys_raw = list_public_keys()
     recipients = []
     for line in keys_raw.splitlines():
-        # Filter to vault.local domain by default — adjust or remove the filter for broader use
         if 'uid' in line:
             m = re.search(r'<([^>]+)>', line)
             if m:
@@ -628,11 +639,134 @@ def toggle_dark_mode():
     resp.set_cookie(DARK_MODE_COOKIE, '0' if dark else '1')
     return resp
 
+# ─── Key Management ─────────────────────────────────────────────────────────────
+
+@app.route('/keys', methods=['GET', 'POST'])
+def keys_page():
+    dark = request.cookies.get(DARK_MODE_COOKIE, '1') == '1'
+    msg = ''
+    keys_raw = list_public_keys()
+
+    if request.method == 'POST':
+        action = request.form.get('action')
+        if action == 'import':
+            key_data = request.form.get('key_data', '').strip()
+            if key_data:
+                out, code = import_public_key(key_data)
+                if code == 0:
+                    msg = '<div class="alert success">Key imported successfully!</div>'
+                    keys_raw = list_public_keys()  # refresh
+                else:
+                    msg = f'<div class="alert error">Import failed: {out}</div>'
+        elif action == 'delete':
+            key_id = request.form.get('key_id', '').strip()
+            if key_id:
+                out, err, code = run_gpg(['--delete-keys', key_id])
+                if code == 0:
+                    msg = '<div class="alert success">Key deleted.</div>'
+                    keys_raw = list_public_keys()
+                else:
+                    msg = f'<div class="alert error">Delete failed: {err}</div>'
+
+    # Parse keys into structured display
+    keys = []
+    current_key = {}
+    for line in keys_raw.splitlines():
+        if line.startswith('pub'):
+            if current_key:
+                keys.append(current_key)
+            parts = line.split()
+            current_key = {'line': line, 'keyid': parts[-1] if parts else '', 'uids': []}
+        elif line.startswith('uid'):
+            m = re.search(r'<([^>]+)>', line)
+            current_key['uids'].append(m.group(1) if m else line.strip())
+        elif line.startswith('fpr'):
+            current_key['fingerprint'] = line.split()[-1]
+    if current_key:
+        keys.append(current_key)
+
+    body = f'''
+    {msg}
+    <div class="card">
+    <h2>Your Public Keys</h2>
+    <p style="color:#8b949e;font-size:0.85rem;margin-bottom:1rem">
+      These are your PUBLIC keys — share these with anyone who wants to send you encrypted messages.
+      Your secret keys are stored separately and never leave this machine.
+    </p>
+    <table style="width:100%;border-collapse:collapse">
+      <tr style="text-align:left;color:#8b949e">
+        <th>Key ID</th><th>Fingerprint</th><th>User IDs</th><th></th>
+      </tr>'''
+    for k in keys:
+        fprint = k.get('fingerprint', '')
+        uid_str = '<br>'.join(k['uids'])
+        keyid = k.get('keyid', '')
+        body += f'''
+      <tr style="border-bottom:1px solid #21262d">
+        <td style="padding:0.5rem;font-family:monospace">{keyid}</td>
+        <td style="padding:0.5rem;font-family:monospace;font-size:0.75rem">{fprint}</td>
+        <td style="padding:0.5rem">{uid_str}</td>
+        <td style="padding:0.5rem">
+          <form method="post" style="display:inline">
+            <input type="hidden" name="action" value="delete">
+            <input type="hidden" name="key_id" value="{keyid}">
+            <button type="submit" class="btn small danger" onclick="return confirm('Delete this public key?')">Delete</button>
+          </form>
+        </td>
+      </tr>'''
+    body += '</table></div>'
+
+    body += f'''
+    <div class="card">
+    <h2>Import a Friend's Public Key</h2>
+    <p style="color:#8b949e;font-size:0.85rem;margin-bottom:1rem">
+      Paste a friend's public key block below to add them as a recipient.
+      Their public key is a <strong>.asc</strong> file they export from their GPG setup.
+    </p>
+    <form method="post">
+      <input type="hidden" name="action" value="import">
+      <div class="form-row">
+        <label>Public key block (-----BEGIN PGP PUBLIC KEY BLOCK-----)</label>
+        <textarea name="key_data" rows="8" placeholder="-----BEGIN PGP PUBLIC KEY BLOCK-----&#10;&#10;...&#10;-----END PGP PUBLIC KEY BLOCK-----"></textarea>
+      </div>
+      <button type="submit" class="btn primary">Import Key</button>
+    </form>
+    </div>
+
+    <div class="card">
+    <h2>How to Export Your Public Key</h2>
+    <pre style="background:#161b22;padding:1rem;border-radius:6px;font-size:0.8rem;overflow-x:auto">
+# Export your public key to a file
+gpg --armor --export your@email.com > my_public_key.asc
+
+# Or get the ASCII-armored block directly
+gpg --armor --export your@email.com
+
+# Share the .asc file with friends — they import it to add you as a recipient
+    </pre>
+    <p style="color:#8b949e;font-size:0.85rem;margin-top:0.5rem">
+      Once imported here, you can select your friend as a recipient when encrypting messages.
+    </p>
+    </div>
+    '''
+    return render('Key Management', 'settings', body, dark)
+
 # ─── Main ──────────────────────────────────────────────────────────────────────
 
 if __name__ == '__main__':
     port = int(os.environ.get('PGP_WEBUI_PORT', '8765'))
     sender = app.config['SENDER_IDENTITY']
+    print(r"""
+   __   __      _____   _   _  ______  _____
+   \ \ / /     |_   _| | \ | ||  ____|/ ____|
+    \ V / ______| | |   |  \| || |__  | (___
+     \   /|______| | |   | . ` ||  __|  \___ \
+     | |         | | |   | |\  || |____ ____) |
+     |_|        |___|   |_| \_||______|_____/
+
+   echo-pgp-webui  |  Echo Vault <echo@vault.local>
+   https://github.com/Echo-Computing/echo-pgp-webui
+""")
     print(f"[*] PGP Vault Web UI starting on http://localhost:{port}")
     print(f"[*] PGP_DIR: {app.config['PGP_DIR']}")
     print(f"[*] SENDER_IDENTITY: {sender}")
