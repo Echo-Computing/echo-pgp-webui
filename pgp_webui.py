@@ -288,7 +288,37 @@ tr:hover td { background: #f6f8fa; }
 .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; }
 """
 
-def base_template(title, active_tab, dark_mode=True):
+BASE_TEMPLATE = """
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>{{ title }} — PGP Vault</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    {{ css }}
+  </style>
+</head>
+<body>
+<div class="container">
+<header>
+  <h1>🔐 PGP Vault</h1>
+  <div class="links">
+    {% for endpoint, label in tabs %}
+    <a href="{{ url_for(endpoint) }}" class="{{ 'active' if active_tab == endpoint else '' }}">{{ label }}</a>
+    {% endfor %}
+    <form method="post" action="{{ url_for('toggle_dark_mode') }}" style="display:inline">
+      <button type="submit" id="dark_toggle" style="background:none;border:none;color:#8b949e;cursor:pointer;font-size:0.8rem;">{{ '☀ light' if dark_mode else '🌙 dark' }}</button>
+    </form>
+  </div>
+</header>
+{{ body }}
+</div>
+</body>
+</html>
+"""
+
+def render(title, active_tab, body_html, dark_mode=True, set_cookie=False):
     css = DARK_CSS if dark_mode else LIGHT_CSS
     tab_links = [
         ('compose', 'Compose'),
@@ -297,27 +327,15 @@ def base_template(title, active_tab, dark_mode=True):
         ('keys_page', 'Keys'),
         ('settings_page', 'Settings'),
     ]
-    tabs_html = ''.join(
-        f'<a href="{url_for(p)}" class="{"active" if active_tab==p else ""}">{lbl}</a>'
-        for p, lbl in tab_links
+    html = render_template_string(BASE_TEMPLATE,
+        title=title,
+        body=body_html,
+        tabs=tab_links,
+        active_tab=active_tab,
+        dark_mode=dark_mode,
+        css=css,
+        url_for=url_for,
     )
-    mode_toggle = f'''<form method="post" action="{url_for("toggle_dark_mode")}" style="display:inline">
-      <button type="submit" id="dark_toggle" style="background:none;border:none;color:#8b949e;cursor:pointer;font-size:0.8rem;">{"☀ light" if dark_mode else "🌙 dark"}</button>
-    </form>'''
-    return f'''<!doctype html><html><head><meta charset="utf-8">
-<title>{title} — PGP Vault</title>
-<style>{css}</style></head><body>
-<div class="container">
-<header>
-  <h1>🔐 PGP Vault</h1>
-  <div class="links">{tabs_html}{mode_toggle}</div>
-</header>
-{{{{ body }}}}
-</div></body></html>'''
-
-def render(title, active_tab, body_html, dark_mode=True, set_cookie=False):
-    t = base_template(title, active_tab, dark_mode)
-    html = t.replace('{{{{ body }}}}', body_html)
     resp = app.make_response(html)
     if set_cookie:
         resp.set_cookie(DARK_MODE_COOKIE, '0' if dark_mode else '1')
@@ -751,6 +769,21 @@ gpg --armor --export your@email.com
     '''
     return render('Key Management', 'settings', body, dark)
 
+# ─── Favicon ─────────────────────────────────────────────────────────────────────
+
+@app.route('/favicon.ico')
+def favicon():
+    import base64
+    # 16x16 blue lock SVG as data URI
+    svg = (
+        '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16">'
+        '<rect width="16" height="16" fill="#161b22" rx="3"/>'
+        '<text x="8" y="12" font-size="10" text-anchor="middle">🔐</text>'
+        '</svg>'
+    )
+    b64 = base64.b64encode(svg.encode()).decode()
+    return f'data:image/svg+xml;base64,{b64}', 200, {'Content-Type': 'image/svg+xml'}
+
 # ─── Main ──────────────────────────────────────────────────────────────────────
 
 if __name__ == '__main__':
@@ -770,7 +803,5 @@ if __name__ == '__main__':
     print(f"[*] PGP Vault Web UI starting on http://localhost:{port}")
     print(f"[*] PGP_DIR: {app.config['PGP_DIR']}")
     print(f"[*] SENDER_IDENTITY: {sender}")
-    if sender == 'CHANGE_ME@vault.local':
-        print("[!] WARNING: Set PGP_SENDER_ID env var before encrypting!")
     print(f"[*] Press Ctrl+C to stop")
     app.run(host='0.0.0.0', port=port, debug=False)
