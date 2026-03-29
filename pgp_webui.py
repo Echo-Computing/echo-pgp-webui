@@ -16,6 +16,7 @@ Configuration via environment variables:
 """
 import logging
 import os
+import shutil
 import sys
 import json
 import subprocess
@@ -31,6 +32,22 @@ SENDER_IDENTITY = os.environ.get('PGP_SENDER_ID', 'CHANGE_ME@vault.local')
 PGP_DIR = Path(os.environ.get('PGP_DIR', '.')).resolve()
 
 sys.path.insert(0, str(PGP_DIR))
+
+# Resolve gpg executable at startup — avoids FileNotFoundError on Windows where
+# Python subprocess doesn't always inherit the shell's PATH.
+def _resolve_gpg():
+    gpg = shutil.which('gpg') or shutil.which('gpg2')
+    if gpg and Path(gpg).exists():
+        return gpg
+    for candidate in [
+        Path('C:/Program Files/Git/usr/bin/gpg.exe'),
+        Path('C:/Program Files (x86)/GnuPG/bin/gpg.exe'),
+    ]:
+        if candidate.exists():
+            return str(candidate)
+    return 'gpg'
+
+GPG_BIN = _resolve_gpg()
 
 try:
     from flask import Flask, request, render_template_string, jsonify, redirect, url_for
@@ -66,7 +83,7 @@ def run_gpg(args, input_text=None, input_file=None, decode=True):
         kwargs['input'] = input_text.encode('utf-8')
     if input_file:
         kwargs['input'] = Path(input_file).read_bytes()
-    result = subprocess.run(['gpg'] + args, **kwargs)
+    result = subprocess.run([GPG_BIN] + args, **kwargs)
     if decode:
         stdout = result.stdout.decode('utf-8', errors='replace')
         stderr = result.stderr.decode('utf-8', errors='replace')
@@ -98,7 +115,7 @@ def encrypt_message(recipient, plaintext, armor=True, output=None):
         args.append('--armor')
     args += ['--recipient', recipient, '--local-user', app.config['SENDER_IDENTITY']]
     kwargs = {'capture_output': True, 'text': True, 'input': plaintext}
-    result = subprocess.run(['gpg'] + args, **kwargs)
+    result = subprocess.run([GPG_BIN] + args, **kwargs)
     if result.returncode == 0 and output:
         Path(output).write_text(result.stdout)
     return result.stdout, result.stderr, result.returncode
