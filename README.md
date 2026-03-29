@@ -287,9 +287,6 @@ GPG isn't in your system PATH. This is fixed in the latest version by auto-detec
 ### GPG asks for passphrase on every operation
 The GPG agent is caching the passphrase for a limited time. Use `gpgconf --kill gpg-agent` to restart it, or set `default-cache-ttl 86400` in your `gpg.conf` for 24-hour caching.
 
-### Slow compression / high CPU
-This is the ZSTD dictionary training phase — expected on first run. Large files (60MB+ Android APKs) compress at ~40 files/min on HDD. This is normal.
-
 ---
 
 ## Production Deployment
