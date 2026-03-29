@@ -33,12 +33,78 @@ python3 pgp_webui.py
 ### 1. Prerequisites
 
 - **Python 3.8+** — [python.org](https://python.org) or Windows Store
-- **GnuPG** — [gpg4win.org](https://www.gpg4win.org) (Windows) or `brew install gnupg` (macOS)
+- **GnuPG** — see OS-specific instructions below
 - **Flask + requests** — `pip install flask requests`
 
 Verify GPG is installed:
 
 ```bash
+gpg --version
+```
+
+#### OS-Specific GPG Installation
+
+**Windows (option A — Git Bash / MSYS2)**
+
+GPG is bundled with Git. If you installed Git, you already have GPG:
+
+```bash
+# Verify
+gpg --version
+# Should show "gpg (GnuPG) 2.4.x" from "C:\Program Files\Git\usr\bin\gpg.exe"
+```
+
+**Windows (option B — GnuPG standalone)**
+- Download from [gpg4win.org](https://www.gpg4win.org) and install
+- The web UI auto-detects `C:\Program Files (x86)\GnuPG\bin\gpg.exe`
+
+**WSL (Windows Subsystem for Linux)**
+
+```bash
+sudo apt update && sudo apt install gnupg
+# Verify
+gpg --version
+```
+
+Set your GPG home dir to a WSL-native path:
+
+```bash
+export GNUPGHOME="$HOME/.gnupg"
+export PGP_DIR="$HOME/.gnupg"
+```
+
+> **Note:** If you switch between Windows GPG and WSL GPG with the same homedir,
+> key permissions and agent sockets can conflict. Use separate homedirs per environment.
+
+**macOS**
+
+```bash
+brew install gnupg
+# Verify
+gpg --version
+```
+
+**Linux (Debian/Ubuntu)**
+
+```bash
+sudo apt update && sudo apt install gnupg
+# Verify
+gpg --version
+```
+
+**Linux (Fedora/RHEL)**
+
+```bash
+sudo dnf install gnupg
+# Verify
+gpg --version
+```
+
+**Linux (Arch)**
+
+```bash
+sudo pacman -S gnupg
+# Verify
 gpg --version
 ```
 
