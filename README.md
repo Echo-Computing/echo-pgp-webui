@@ -263,7 +263,39 @@ print(dec_resp["plaintext"])
 The **Settings → Confirmation Guard** adds a passphrase prompt before encrypt/decrypt operations. Useful on shared machines.
 
 ### GPG Agent
-GPG caches your passphrase in memory via `gpg-agent`. Use **Settings → Kill Agent** to force-clear the cache (e.g. before leaving your machine).
+
+The GPG Agent (`gpg-agent`) is a daemon that comes bundled with GPG — you don't install it separately. It caches your private key passphrase in memory so you don't have to retype it on every operation.
+
+**Do home users need it?** It depends on your setup:
+
+- **Local AI only, single-user machine, no roommates/partners:** GPG Agent is optional. You'll be prompted for your passphrase each time you encrypt/decrypt. If you prefer not to deal with this, GPG Agent caches it for you automatically once started.
+- **Shared machine, even at home:** GPG Agent is recommended — set a short cache TTL (see below).
+- **AI running on a different machine than the web UI:** GPG Agent runs wherever your private keys are (i.e., the machine running the web UI).
+
+**Check if GPG Agent is running:**
+
+```bash
+gpg-agent --version          # confirms it's installed
+gpgconf --list-dir agent     # shows agent socket path
+```
+
+**Configure passphrase cache TTL** (optional — add to `~/.gnupg/gpg.conf` or `%APPDATA%\gnupg\gpg.conf`):
+
+```
+default-cache-ttl 3600       # cache passphrase for 1 hour
+max-cache-ttl 86400          # max cache time: 24 hours
+```
+
+**Restart agent after changing config:**
+
+```bash
+gpgconf --kill gpg-agent    # stop
+gpg-agent --daemon          # start fresh (or just start the web UI)
+```
+
+The **Settings → Kill Agent** button in the web UI does both steps — kills the agent and relaunches it with a fresh cache.
+
+**WSL特别注意:** If you're using WSL GPG with the web UI on Windows, make sure both environments use the same `GNUPGHOME` path or different homedirs to avoid socket conflicts.
 
 ### Clipboard Auto-Clear
 Decrypted plaintext is copied to clipboard and auto-clears after 30 seconds (configurable via `PGP_CLIPBOARD_CLEAR_SECONDS`).
