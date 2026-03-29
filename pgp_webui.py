@@ -312,7 +312,7 @@ BASE_TEMPLATE = """
     </form>
   </div>
 </header>
-{{ body }}
+{{ body | safe }}
 </div>
 </body>
 </html>
