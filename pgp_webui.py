@@ -475,31 +475,73 @@ def inbox():
             content = f.read_text(errors='replace')
             if '-----BEGIN PGP MESSAGE-----' not in content:
                 continue
-            out, err, code = decrypt_text(content)
-            status = 'decrypted' if code == 0 else 'encrypted'
+            # Lazy: just show file info, don't decrypt
+            stat = f.stat()
             messages.append({
                 'file': f.name,
-                'status': status,
-                'preview': out[:200] if code == 0 else ('encrypted — ' + f.name),
-                'content': out if code == 0 else '',
+                'status': 'encrypted',
+                'size': stat.st_size,
+                'mtime': datetime.fromtimestamp(stat.st_mtime).strftime('%Y-%m-%d %H:%M'),
             })
         except Exception as e:
-            messages.append({'file': f.name, 'status': 'error', 'preview': str(e), 'content': ''})
+            messages.append({'file': f.name, 'status': 'error', 'size': 0, 'mtime': '', 'error': str(e)})
+
     rows = ''
-    for m in messages[:20]:
-        rows += f'''<tr>
+    for m in messages[:30]:
+        error_attr = f' data-error="{m.get("error","")}"' if 'error' in m else ''
+        rows += f'''<tr data-file="{m['file']}"{error_attr}>
           <td><code>{m['file']}</code></td>
-          <td><span class="value {'ok' if m['status']=='decrypted' else 'warn'}">{m['status']}</span></td>
-          <td><code>{m['preview'][:80]}</code></td>
-          <td><button class="btn" onclick="copyFile('{m['file']}', this)">📋 Copy</button></td>
+          <td>{m.get('mtime','')}</td>
+          <td>{m.get('size', 0)} bytes</td>
+          <td>
+            <button class="btn" onclick="decryptMsg('{m['file']}', this)" id="btn-{m['file']}">🔓 Decrypt</button>
+            <button class="btn" onclick="copyFile('{m['file']}', this)">📋 Copy</button>
+          </td>
+        </tr>
+        <tr class="decrypted-row" id="row-{m['file']}" style="display:none">
+          <td colspan="4">
+            <div class="decrypted-content" id="content-{m['file']}"></div>
+          </td>
         </tr>'''
+
     body = f'''
-    {f'<div class="alert info">{len(messages)} messages found</div>' if messages else '<div class="alert info">No .asc files found in {pgp_dir}</div>'}
+    <style>
+    .decrypted-content {{ background:#0d1117; border:1px solid #30363d; border-radius:6px; padding:1rem; margin-top:0.5rem; white-space:pre-wrap; word-break:break-all; max-height:400px; overflow-y:auto; font-size:0.85rem; }}
+    table {{ width:100%; border-collapse:collapse; }}
+    .decrypted-row td {{ padding:0.5rem 1rem 1rem; background:#161b22; }}
+    </style>
+    {f'<div class="alert info">{len(messages)} encrypted messages found — click Decrypt to reveal content</div>' if messages else f'<div class="alert info">No .asc files found in {pgp_dir}</div>'}
     <div class="card"><h2>Inbox</h2>
-    <table><thead><tr><th>File</th><th>Status</th><th>Preview</th><th></th></tr></thead>
+    <table><thead><tr><th>File</th><th>Modified</th><th>Size</th><th>Actions</th></tr></thead>
     <tbody>{rows}</tbody></table>
     </div>
     <script>
+    async function decryptMsg(filename, btn) {{
+      let row = document.getElementById('row-' + filename);
+      let content = document.getElementById('content-' + filename);
+      if (row.style.display === 'table-row') {{
+        row.style.display = 'none';
+        btn.textContent = '🔓 Decrypt';
+        return;
+      }}
+      btn.disabled = true;
+      btn.textContent = 'Decrypting...';
+      try {{
+        let resp = await fetch('/inbox/decrypt/' + encodeURIComponent(filename), {{ method: 'POST' }});
+        let data = await resp.json();
+        if (data.error) {{
+          content.innerHTML = '<div class="alert error">Decryption failed: ' + data.error + '</div>';
+        }} else {{
+          content.textContent = data.plaintext;
+        }}
+        row.style.display = 'table-row';
+        btn.textContent = '🔒 Hide';
+      }} catch(e) {{
+        content.innerHTML = '<div class="alert error">Request failed: ' + e.message + '</div>';
+        row.style.display = 'table-row';
+      }}
+      btn.disabled = false;
+    }}
     async function copyFile(filename, btn) {{
       try {{
         let resp = await fetch('/inbox/raw/' + encodeURIComponent(filename));
@@ -514,6 +556,24 @@ def inbox():
     }}
     </script>'''
     return render('Inbox', 'inbox', body, dark)
+
+@app.route('/inbox/decrypt/<filename>', methods=['POST'])
+def inbox_decrypt(filename):
+    """Decrypt a message on-demand, return plaintext (never persisted)."""
+    pgp_dir = app.config['PGP_DIR']
+    safe_name = Path(filename).name
+    file_path = pgp_dir / safe_name
+    if not file_path.exists() or not file_path.is_file():
+        return jsonify({'error': 'File not found'}), 404
+    try:
+        content = file_path.read_text(errors='replace')
+        out, err, code = decrypt_text(content)
+        if code == 0:
+            return jsonify({'plaintext': out})
+        else:
+            return jsonify({'error': err or 'Decryption failed'})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
 
 @app.route('/inbox/raw/<filename>')
 def inbox_raw(filename):
