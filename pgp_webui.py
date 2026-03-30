@@ -640,8 +640,14 @@ def inbox():
       if (!confirm('Delete this message from DB and disk?')) return;
       try {{
         let resp = await fetch('/api/messages/' + id, {{method:'DELETE'}});
+        if (resp.status === 404) {{
+          // Already gone — silently remove from UI
+          btn.closest('tr').nextSibling?.remove();
+          btn.closest('tr').remove();
+          return;
+        }}
         if (!resp.ok) throw new Error(await resp.text());
-        btn.closest('tr').nextSibling.remove();
+        btn.closest('tr').nextSibling?.remove();
         btn.closest('tr').remove();
       }} catch(e) {{ alert('Delete failed: '+e.message); }}
     }}
