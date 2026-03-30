@@ -15,6 +15,8 @@ import subprocess
 import time
 import threading
 import re
+import sqlite3
+import hashlib
 from pathlib import Path
 from datetime import datetime
 
@@ -22,6 +24,9 @@ from datetime import datetime
 # REPLACE THESE with your actual identity before running
 SENDER_IDENTITY = 'echo@vault.local'
 PGP_DIR = Path('D:/pgp')
+
+# ── Database ─────────────────────────────────────────────────────────────────
+DB_PATH = Path(os.environ.get('PGP_DB_PATH', str(PGP_DIR / 'messages.db')))
 
 sys.path.insert(0, str(PGP_DIR))
 
@@ -56,6 +61,72 @@ logger = logging.getLogger(__name__)
 app = Flask(__name__)
 app.config['PGP_DIR'] = PGP_DIR
 app.config['SENDER_IDENTITY'] = SENDER_IDENTITY
+app.config['DB_PATH'] = DB_PATH
+
+# ─── SQLite Storage ──────────────────────────────────────────────────────────
+
+def get_db() -> sqlite3.Connection:
+    """Get thread-local DB connection."""
+    if not hasattr(threading.current_thread(), '_db'):
+        conn = sqlite3.connect(str(DB_PATH), check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        _init_db_schema(conn)
+        threading.current_thread()._db = conn
+    return threading.current_thread()._db
+
+def _init_db_schema(conn: sqlite3.Connection):
+    """Initialize DB schema if not exists."""
+    conn.execute('''
+        CREATE TABLE IF NOT EXISTS messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp TEXT NOT NULL,
+            sender TEXT NOT NULL,
+            recipient TEXT NOT NULL,
+            subject TEXT DEFAULT '',
+            file_path TEXT DEFAULT '',
+            content_hash TEXT NOT NULL,
+            verified INTEGER DEFAULT 0,
+            encrypted_payload TEXT NOT NULL,
+            created_at TEXT DEFAULT (datetime('now'))
+        )
+    ''')
+    conn.execute('CREATE INDEX IF NOT EXISTS idx_recipient ON messages(recipient)')
+    conn.execute('CREATE INDEX IF NOT EXISTS idx_timestamp ON messages(timestamp)')
+    conn.execute('CREATE INDEX IF NOT EXISTS idx_sender ON messages(sender)')
+    conn.commit()
+
+def _import_sent_log() -> int:
+    """Import existing sent_log.json into DB on first run. Returns count."""
+    conn = get_db()
+    sent_log = PGP_DIR / 'sent_log.json'
+    if not sent_log.exists():
+        return 0
+    # Check if already imported
+    row = conn.execute("SELECT COUNT(*) as c FROM messages WHERE file_path LIKE 'D:/pgp/reply%'").fetchone()
+    if row['c'] > 0:
+        return 0  # Already imported
+
+    count = 0
+    try:
+        entries = json.loads(sent_log.read_text())
+        for e in entries:
+            fp = Path(e.get('output', ''))
+            if not fp.exists():
+                continue
+            content = fp.read_text(errors='replace')
+            h = hashlib.sha256(content.encode()).hexdigest()
+            conn.execute('''
+                INSERT OR IGNORE INTO messages
+                    (timestamp, sender, recipient, subject, file_path, content_hash, encrypted_payload)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            ''', (e.get('timestamp', ''), SENDER_IDENTITY, e.get('recipient', ''),
+                  '', str(fp), h, content))
+            count += 1
+        conn.commit()
+        print(f"[*] Imported {count} entries from sent_log.json")
+    except Exception as ex:
+        print(f"[!] sent_log import failed: {ex}")
+    return count
 
 # ─── Dark mode toggle via cookie ───────────────────────────────────────────────
 
@@ -836,9 +907,149 @@ def favicon():
     b64 = base64.b64encode(svg.encode()).decode()
     return f'data:image/svg+xml;base64,{b64}', 200, {'Content-Type': 'image/svg+xml'}
 
+# ─── REST API ──────────────────────────────────────────────────────────────────
+
+@app.route('/api/messages', methods=['GET', 'POST'])
+def api_messages():
+    """
+    GET /api/messages — list messages with optional filters
+        ?recipient=... &since=... &sender=... &limit=50 &offset=0
+    POST /api/messages — encrypt and store a new message
+        body: {"recipient": "...", "plaintext": "...", "subject": "..."}
+    """
+    conn = get_db()
+
+    if request.method == 'GET':
+        recipient = request.args.get('recipient', '')
+        sender = request.args.get('sender', '')
+        since = request.args.get('since', '')
+        limit = min(int(request.args.get('limit', 50)), 200)
+        offset = int(request.args.get('offset', 0))
+
+        query = 'SELECT * FROM messages WHERE 1=1'
+        params = []
+        if recipient:
+            query += ' AND recipient = ?'
+            params.append(recipient)
+        if sender:
+            query += ' AND sender = ?'
+            params.append(sender)
+        if since:
+            query += ' AND timestamp >= ?'
+            params.append(since)
+
+        query += ' ORDER BY timestamp DESC LIMIT ? OFFSET ?'
+        params.extend([limit, offset])
+
+        rows = conn.execute(query, params).fetchall()
+        return jsonify([dict(r) for r in rows])
+
+    # POST — encrypt and save new message
+    data = request.get_json(force=True)
+    recipient = (data.get('recipient') or '').strip()
+    plaintext = (data.get('plaintext') or '').strip()
+    subject = (data.get('subject') or '').strip()[:200]
+
+    if not recipient or not plaintext:
+        return jsonify({'error': 'recipient and plaintext are required'}), 400
+
+    # Encrypt via GPG
+    ts = datetime.utcnow().strftime('%Y%m%d_%H%M%S')
+    reply_num = _next_reply_num(conn)
+    out_path = PGP_DIR / f'reply{reply_num}.asc'
+
+    out, err, code = encrypt_message(recipient, plaintext, armor=True, output=str(out_path))
+    if code != 0:
+        return jsonify({'error': f'Encryption failed: {err}'}), 500
+
+    # Store in DB
+    content = out_path.read_text(errors='replace')
+    h = hashlib.sha256(content.encode()).hexdigest()
+    cursor = conn.execute('''
+        INSERT INTO messages (timestamp, sender, recipient, subject, file_path, content_hash, encrypted_payload)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+    ''', (datetime.utcnow().isoformat(), SENDER_IDENTITY, recipient, subject, str(out_path), h, content))
+    conn.commit()
+
+    # Update sent_log.json for backwards compat
+    _append_sent_log(recipient, str(out_path))
+
+    return jsonify({
+        'id': cursor.lastrowid,
+        'timestamp': datetime.utcnow().isoformat(),
+        'recipient': recipient,
+        'subject': subject,
+        'file': out_path.name,
+        'content_hash': h,
+    }), 201
+
+@app.route('/api/messages/<int:msg_id>', methods=['GET', 'DELETE'])
+def api_message(msg_id):
+    """GET a single message by ID. DELETE to remove."""
+    conn = get_db()
+    row = conn.execute('SELECT * FROM messages WHERE id = ?', (msg_id,)).fetchone()
+    if not row:
+        return jsonify({'error': 'Not found'}), 404
+
+    if request.method == 'DELETE':
+        conn.execute('DELETE FROM messages WHERE id = ?', (msg_id,))
+        conn.commit()
+        return jsonify({'deleted': msg_id})
+
+    # GET — decrypt on demand
+    plaintext, err, code = decrypt_text(row['encrypted_payload'])
+    if code != 0:
+        return jsonify({'error': f'Decryption failed: {err}'}), 500
+    return jsonify({
+        'id': row['id'],
+        'timestamp': row['timestamp'],
+        'sender': row['sender'],
+        'recipient': row['recipient'],
+        'subject': row['subject'],
+        'file_path': row['file_path'],
+        'content_hash': row['content_hash'],
+        'plaintext': plaintext,
+    })
+
+# ─── Helpers ──────────────────────────────────────────────────────────────────
+
+def _next_reply_num(conn) -> int:
+    """Get next reply number from DB or file scan as fallback."""
+    row = conn.execute(
+        "SELECT file_path FROM messages WHERE file_path LIKE ? ORDER BY id DESC LIMIT 1",
+        ('%/reply%.asc',)
+    ).fetchone()
+    if row:
+        import re
+        m = re.search(r'reply(\d+)', row[0])
+        if m:
+            return int(m.group(1)) + 1
+    # Fallback to file scan
+    nums = []
+    for f in PGP_DIR.glob('reply*.asc'):
+        import re
+        m = re.match(r'reply(\d+)', f.name)
+        if m:
+            nums.append(int(m.group(1)))
+    return (max(nums) if nums else 0) + 1
+
+def _append_sent_log(recipient, file_path):
+    """Append to sent_log.json for backwards compat."""
+    log_path = PGP_DIR / 'sent_log.json'
+    log = []
+    if log_path.exists():
+        try: log = json.loads(log_path.read_text())
+        except: pass
+    log.append({'timestamp': datetime.utcnow().isoformat(), 'recipient': recipient, 'output': file_path})
+    log_path.write_text(json.dumps(log, indent=2))
+
 # ─── Main ──────────────────────────────────────────────────────────────────────
 
 if __name__ == '__main__':
+    # Initialize DB and import existing sent_log on first run
+    conn = get_db()
+    imported = _import_sent_log()
+
     port = int(os.environ.get('PGP_WEBUI_PORT', '8765'))
     sender = app.config['SENDER_IDENTITY']
     print(r"""
@@ -854,6 +1065,9 @@ if __name__ == '__main__':
 """)
     print(f"[*] PGP Vault Web UI starting on http://localhost:{port}")
     print(f"[*] PGP_DIR: {app.config['PGP_DIR']}")
+    print(f"[*] DB_PATH: {app.config['DB_PATH']}")
     print(f"[*] SENDER_IDENTITY: {sender}")
+    if imported:
+        print(f"[*] Imported {imported} entries from sent_log.json")
     print(f"[*] Press Ctrl+C to stop")
     app.run(host='0.0.0.0', port=port, debug=False)
