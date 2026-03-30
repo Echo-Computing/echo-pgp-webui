@@ -13,7 +13,17 @@ PGP_DIR = Path('D:/pgp')
 SENT_LOG = PGP_DIR / 'sent_log.json'
 BACKUP_LOG = PGP_DIR / 'sent_log.json.bak'
 
-GPG_BIN = shutil.which('gpg') or shutil.which('gpg2') or 'gpg'
+GPG_BIN = shutil.which('gpg') or shutil.which('gpg2')
+if not GPG_BIN:
+    for candidate in [
+        Path('C:/Program Files/Git/usr/bin/gpg.exe'),
+        Path('C:/Program Files (x86)/GnuPG/bin/gpg.exe'),
+    ]:
+        if candidate.exists():
+            GPG_BIN = str(candidate)
+            break
+if not GPG_BIN:
+    GPG_BIN = 'gpg'
 
 def get_gpg_metadata(asc_path):
     """Extract recipient and timestamp from GPG packet without decrypting."""
