@@ -296,7 +296,7 @@ BASE_TEMPLATE = """
   <title>{{ title }} — PGP Vault</title>
   <style>
     * { box-sizing: border-box; margin: 0; padding: 0; }
-    {{ css }}
+    {{ css | safe }}
   </style>
 </head>
 <body>
