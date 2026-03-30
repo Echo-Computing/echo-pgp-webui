@@ -1,6 +1,6 @@
 # PGP Vault Web UI
 
-A standalone, self-hosted Flask web interface for GPG encrypt/decrypt operations. No database, no external services — everything stays on your machine.
+A standalone, self-hosted Flask web interface for GPG encrypt/decrypt operations. SQLite-backed message storage — everything stays on your machine.
 
 **Use cases:**
 - Encrypt messages to friends using their public PGP keys
@@ -20,6 +20,7 @@ pip install flask requests gnupg
 # Configure your identity
 export PGP_SENDER_ID="you@yourdomain.com"
 export PGP_DIR="$HOME/.gnupg"        # your GPG home directory
+export PGP_DB_PATH="$HOME/.gnupg/messages.db"  # SQLite database (default: PGP_DIR/messages.db)
 export PGP_WEBUI_PORT=8765
 
 python3 pgp_webui.py
@@ -137,6 +138,7 @@ gpg --full-generate-key
 |---|---|---|---|
 | `PGP_SENDER_ID` | **Yes** | — | Your sending key — email or key ID (e.g. `you@example.com`) |
 | `PGP_DIR` | No | `~/.gnupg` | Path to your GPG home directory |
+| `PGP_DB_PATH` | No | `PGP_DIR/messages.db` | Path to SQLite database for message storage |
 | `PGP_WEBUI_PORT` | No | `8765` | Port to listen on |
 | `PGP_CLIPBOARD_CLEAR_SECONDS` | No | `30` | Auto-clear clipboard after N seconds |
 | `PGP_MAX_ATTEMPTS` | No | `5` | Failed decrypt attempts before lockout |
@@ -308,24 +310,152 @@ After 5 failed decrypt attempts (wrong key/passphrase), the UI locks for 5 minut
 ## File Layout
 
 ```
-PGP_DIR/                    # set via PGP_DIR env var
-├── reply0.asc              # encrypted outputs from Compose tab
+PGP_DIR/                        # set via PGP_DIR env var
+├── messages.db                # SQLite — message metadata + encrypted payloads
+├── reply0.asc                 # encrypted output files
 ├── reply1.asc
-├── sent_log.json           # history of sent messages
-├── .tmp_dec_*.asc          # temp files (cleaned up after decrypt)
-└── .tmp_import_*.asc       # temp files (cleaned up after key import)
+├── sent_log.json              # legacy log (updated on new sends for compat)
+├── .tmp_dec_*.asc             # temp files (cleaned up after decrypt)
+└── .tmp_import_*.asc          # temp files (cleaned up after key import)
 
 echo-pgp-webui/
-├── pgp_webui.py            # the Flask application
-├── README.md               # this file
+├── pgp_webui.py                # the Flask application
+├── db.py                       # SQLite storage backend
+├── rebuild_sent_log.py         # utility to rescan .asc files and rebuild sent_log.json
+├── README.md                   # this file
 └── .gitignore
 ```
+
+### SQLite Database Schema
+
+The `messages.db` stores all message metadata and encrypted payloads:
+
+```sql
+CREATE TABLE messages (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp       TEXT    NOT NULL,        -- ISO 8601, e.g. "2026-03-30T03:14:47"
+    sender          TEXT    NOT NULL,        -- your identity (PGP_SENDER_ID)
+    recipient       TEXT    NOT NULL,        -- recipient email/key ID
+    subject         TEXT    DEFAULT '',
+    file_path       TEXT    DEFAULT '',      -- path to .asc file on disk
+    content_hash    TEXT    NOT NULL,        -- SHA-256 of encrypted payload
+    verified        INTEGER DEFAULT 0,       -- GPG signature verification
+    encrypted_payload TEXT  NOT NULL,        -- full ASCII-armored PGP message
+    created_at      TEXT    DEFAULT (datetime('now'))
+);
+
+CREATE INDEX idx_recipient    ON messages(recipient);
+CREATE INDEX idx_timestamp   ON messages(timestamp);
+CREATE INDEX idx_sender      ON messages(sender);
+```
+
+> **Security:** The `encrypted_payload` column holds the full ASCII-armored PGP message — private keys never leave the GPG keyring, only the ciphertext is in the DB.
 
 ---
 
 ## API Reference
 
-### `POST /compose`
+### REST API — `/api/*`
+
+All `/api/*` endpoints accept and return JSON. Use this for programmatic access.
+
+#### `POST /api/messages`
+
+Encrypt and store a new message. Stores in SQLite DB and writes `.asc` file to disk.
+
+```bash
+curl -X POST http://localhost:8765/api/messages \
+  -H "Content-Type: application/json" \
+  -d '{"recipient": "friend@example.com", "plaintext": "Hello!", "subject": "Hi"}'
+```
+
+**Response:**
+```json
+{
+  "id": 106,
+  "timestamp": "2026-03-30T12:00:00.000Z",
+  "recipient": "friend@example.com",
+  "subject": "Hi",
+  "file": "reply106.asc",
+  "content_hash": "a1b2c3..."
+}
+```
+
+#### `GET /api/messages`
+
+List messages with optional filters. Returns message metadata (not plaintext).
+
+```bash
+# All messages, most recent first
+curl "http://localhost:8765/api/messages"
+
+# Filter by recipient
+curl "http://localhost:8765/api/messages?recipient=friend@example.com"
+
+# Messages since a date
+curl "http://localhost:8765/api/messages?since=2026-03-01"
+
+# Pagination
+curl "http://localhost:8765/api/messages?limit=20&offset=40"
+```
+
+**Response:**
+```json
+[
+  {
+    "id": 106,
+    "timestamp": "2026-03-30T12:00:00",
+    "sender": "you@yourdomain.com",
+    "recipient": "friend@example.com",
+    "subject": "Hi",
+    "file_path": "D:/pgp/reply106.asc",
+    "content_hash": "a1b2c3..."
+  }
+]
+```
+
+#### `GET /api/messages/<id>`
+
+Decrypt and return a single message by ID.
+
+```bash
+curl "http://localhost:8765/api/messages/106"
+```
+
+**Response:**
+```json
+{
+  "id": 106,
+  "timestamp": "2026-03-30T12:00:00",
+  "sender": "you@yourdomain.com",
+  "recipient": "friend@example.com",
+  "subject": "Hi",
+  "plaintext": "Hello!",
+  "content_hash": "a1b2c3..."
+}
+```
+
+#### `DELETE /api/messages/<id>`
+
+Delete a message from the DB. Does NOT delete the `.asc` file.
+
+```bash
+curl -X DELETE "http://localhost:8765/api/messages/106"
+```
+
+#### `POST /api/wipe`
+
+**Kill GPG agent, wipe all messages from DB, delete all `.asc` files in `PGP_DIR`.** Irreversible.
+
+```bash
+curl -X POST "http://localhost:8765/api/wipe" \
+  -H "Content-Type: application/json" \
+  -d '{"confirm": "yes"}'
+```
+
+---
+
+### Web UI — `POST /compose`
 
 Encrypt or decrypt a message.
 

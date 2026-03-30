@@ -536,43 +536,73 @@ def compose():
 def inbox():
     dark = request.cookies.get(DARK_MODE_COOKIE, '1') == '1'
     pgp_dir = app.config['PGP_DIR']
+
+    # Load from SQLite DB — get messages NOT from current sender (i.e. received messages)
+    conn = get_db()
+    rows = conn.execute('''
+        SELECT id, timestamp, sender, recipient, subject, file_path, content_hash
+        FROM messages
+        WHERE sender != ?
+        ORDER BY timestamp DESC
+        LIMIT 50
+    ''', (SENDER_IDENTITY,)).fetchall()
+
     messages = []
-    for f in sorted(pgp_dir.glob('*.asc'), key=lambda f: f.stat().st_mtime, reverse=True):
+    for r in rows:
+        fp = Path(r['file_path']) if r['file_path'] else None
+        messages.append({
+            'id': r['id'],
+            'file': Path(r['file_path']).name if r['file_path'] else '',
+            'timestamp': r['timestamp'],
+            'sender': r['sender'],
+            'recipient': r['recipient'],
+            'subject': r['subject'],
+            'size': fp.stat().st_size if fp and fp.exists() else 0,
+        })
+
+    # Fallback: scan disk for .asc files not yet in DB (backwards compat)
+    logged_files = {Path(r['file_path']).name for r in rows if r['file_path']}
+    for f in sorted(pgp_dir.glob('*.asc'), key=lambda x: x.stat().st_mtime, reverse=True):
+        if f.name in logged_files:
+            continue
         if any(f.name.startswith(p) for p in ('out_', 'roundtrip', 'reply_')):
             continue
         if '_public.asc' in f.name or '_private.asc' in f.name:
             continue
         try:
             content = f.read_text(errors='replace')
-            if '-----BEGIN PGP MESSAGE-----' not in content:
-                continue
-            # Lazy: just show file info, don't decrypt
-            stat = f.stat()
-            messages.append({
-                'file': f.name,
-                'status': 'encrypted',
-                'size': stat.st_size,
-                'mtime': datetime.fromtimestamp(stat.st_mtime).strftime('%Y-%m-%d %H:%M'),
-            })
-        except Exception as e:
-            messages.append({'file': f.name, 'status': 'error', 'size': 0, 'mtime': '', 'error': str(e)})
+            if '-----BEGIN PGP MESSAGE-----' in content:
+                messages.append({
+                    'id': None,
+                    'file': f.name,
+                    'timestamp': datetime.fromtimestamp(f.stat().st_mtime).isoformat(),
+                    'sender': 'unknown',
+                    'recipient': '',
+                    'subject': '',
+                    'size': f.stat().st_size,
+                })
+        except:
+            pass
 
-    rows = ''
+    messages.sort(key=lambda x: x.get('timestamp', ''), reverse=True)
+
+    html_rows = ''
     for m in messages[:30]:
-        error_attr = f' data-error="{m.get("error","")}"' if 'error' in m else ''
-        rows += f'''<tr data-file="{m['file']}"{error_attr}>
+        has_id = m['id'] is not None
+        trash = '🗑'
+        delete_btn = f'<button class="btn danger" onclick="deleteMsg({m["id"]}, this)">{trash} Delete</button>' if has_id else ''
+        html_rows += f'''<tr>
           <td><code>{m['file']}</code></td>
-          <td>{m.get('mtime','')}</td>
-          <td>{m.get('size', 0)} bytes</td>
+          <td>{m.get('sender','')}</td>
+          <td>{m.get('timestamp','')[:16]}</td>
           <td>
-            <button class="btn" onclick="decryptMsg('{m['file']}', this)" id="btn-{m['file']}">🔓 Decrypt</button>
+            <button class="btn" onclick="decryptFile('{m['file']}', this)">🔓 Decrypt</button>
             <button class="btn" onclick="copyFile('{m['file']}', this)">📋 Copy</button>
+            {delete_btn}
           </td>
         </tr>
         <tr class="decrypted-row" id="row-{m['file']}" style="display:none">
-          <td colspan="4">
-            <div class="decrypted-content" id="content-{m['file']}"></div>
-          </td>
+          <td colspan="4"><div class="decrypted-content" id="content-{m['file']}"></div></td>
         </tr>'''
 
     body = f'''
@@ -581,70 +611,57 @@ def inbox():
     table {{ width:100%; border-collapse:collapse; }}
     .decrypted-row td {{ padding:0.5rem 1rem 1rem; background:#161b22; }}
     </style>
-    {f'<div class="alert info">{len(messages)} encrypted messages found — click Decrypt to reveal content</div>' if messages else f'<div class="alert info">No .asc files found in {pgp_dir}</div>'}
+    {f'<div class="alert info">{len(messages)} messages — lazy decrypt: click to reveal</div>' if messages else f'<div class="alert info">No messages found</div>'}
     <div class="card"><h2>Inbox</h2>
-    <table><thead><tr><th>File</th><th>Modified</th><th>Size</th><th>Actions</th></tr></thead>
-    <tbody>{rows}</tbody></table>
+    <table><thead><tr><th>File</th><th>From</th><th>Time</th><th>Actions</th></tr></thead>
+    <tbody>{html_rows}</tbody></table>
     </div>
     <script>
-    async function decryptMsg(filename, btn) {{
+    async function decryptFile(filename, btn) {{
       let row = document.getElementById('row-' + filename);
       let content = document.getElementById('content-' + filename);
-      if (row.style.display === 'table-row') {{
-        row.style.display = 'none';
-        btn.textContent = '🔓 Decrypt';
-        return;
-      }}
-      btn.disabled = true;
-      btn.textContent = 'Decrypting...';
+      if (row.style.display === 'table-row') {{ row.style.display='none'; btn.textContent='🔓 Decrypt'; return; }}
       try {{
-        let resp = await fetch('/inbox/decrypt/' + encodeURIComponent(filename), {{ method: 'POST' }});
+        let resp = await fetch('/inbox/decrypt_file/' + encodeURIComponent(filename));
         let data = await resp.json();
-        if (data.error) {{
-          content.innerHTML = '<div class="alert error">Decryption failed: ' + data.error + '</div>';
-        }} else {{
-          content.textContent = data.plaintext;
-        }}
-        row.style.display = 'table-row';
-        btn.textContent = '🔒 Hide';
-      }} catch(e) {{
-        content.innerHTML = '<div class="alert error">Request failed: ' + e.message + '</div>';
-        row.style.display = 'table-row';
-      }}
-      btn.disabled = false;
+        if (data.error) {{ content.innerHTML='<div class="alert error">'+data.error+'</div>'; }}
+        else {{ content.textContent = data.plaintext; }}
+        row.style.display='table-row'; btn.textContent='🔒 Hide';
+      }} catch(e) {{ content.innerHTML='<div class="alert error">'+e.message+'</div>'; row.style.display='table-row'; }}
     }}
     async function copyFile(filename, btn) {{
       try {{
         let resp = await fetch('/inbox/raw/' + encodeURIComponent(filename));
-        if (!resp.ok) throw new Error('Failed to load file');
-        let text = await resp.text();
-        await navigator.clipboard.writeText(text);
-        btn.textContent = '✓ Copied';
-        setTimeout(() => {{ btn.textContent = '📋 Copy'; }}, 1500);
-      }} catch(e) {{
-        alert('Copy failed: ' + e.message);
-      }}
+        if (!resp.ok) throw new Error('Failed');
+        await navigator.clipboard.writeText(await resp.text());
+        btn.textContent='✓ Copied'; setTimeout(()=>{{btn.textContent='📋 Copy';}},1500);
+      }} catch(e) {{ alert('Copy failed: '+e.message); }}
+    }}
+    async function deleteMsg(id, btn) {{
+      if (!confirm('Delete this message from DB and disk?')) return;
+      try {{
+        let resp = await fetch('/api/messages/' + id, {{method:'DELETE'}});
+        if (!resp.ok) throw new Error(await resp.text());
+        btn.closest('tr').nextSibling.remove();
+        btn.closest('tr').remove();
+      }} catch(e) {{ alert('Delete failed: '+e.message); }}
     }}
     </script>'''
     return render('Inbox', 'inbox', body, dark)
 
-@app.route('/inbox/decrypt/<filename>', methods=['POST'])
-def inbox_decrypt(filename):
-    """Decrypt a message on-demand, return plaintext (never persisted)."""
+@app.route('/inbox/decrypt_file/<filename>')
+def inbox_decrypt_file(filename):
+    """Decrypt a file by filename (for lazy decrypt from inbox)."""
     pgp_dir = app.config['PGP_DIR']
     safe_name = Path(filename).name
     file_path = pgp_dir / safe_name
-    if not file_path.exists() or not file_path.is_file():
+    if not file_path.exists():
         return jsonify({'error': 'File not found'}), 404
-    try:
-        content = file_path.read_text(errors='replace')
-        out, err, code = decrypt_text(content)
-        if code == 0:
-            return jsonify({'plaintext': out})
-        else:
-            return jsonify({'error': err or 'Decryption failed'})
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
+    content = file_path.read_text(errors='replace')
+    out, err, code = decrypt_text(content)
+    if code == 0:
+        return jsonify({'plaintext': out})
+    return jsonify({'error': err or 'Decryption failed'}), 500
 
 @app.route('/inbox/raw/<filename>')
 def inbox_raw(filename):
@@ -759,9 +776,35 @@ def settings_page():
     <table>
       <tr><td>PGP_SENDER_ID</td><td><code>{app.config['SENDER_IDENTITY']}</code></td></tr>
       <tr><td>PGP_DIR</td><td><code>{app.config['PGP_DIR']}</code></td></tr>
+      <tr><td>PGP_DB_PATH</td><td><code>{app.config['DB_PATH']}</code></td></tr>
       <tr><td>PGP_CLIPBOARD_CLEAR_SECONDS</td><td><code>{os.environ.get('PGP_CLIPBOARD_CLEAR_SECONDS','30')}</code></td></tr>
       <tr><td>PGP_MAX_ATTEMPTS</td><td><code>{os.environ.get('PGP_MAX_ATTEMPTS','5')}</code></td></tr>
     </table>
+    </div>
+    <div class="card">
+    <h2>Danger Zone</h2>
+    <p style="color:#8b949e;font-size:0.85rem;margin-bottom:1rem">
+      This wipes ALL messages — kills the GPG agent, purges the SQLite DB, deletes all reply*.asc files, and clears the sent log. <strong>This cannot be undone.</strong>
+    </p>
+    <button class="btn danger" onclick="doWipe()">☠️ Wipe All Messages</button>
+    <script>
+    async function doWipe() {{
+      if (!confirm('Really wipe ALL messages? This kills GPG agent, deletes the DB, and all .asc files. CANNOT BE UNDONE.')) return;
+      if (!confirm('Are you absolutely sure? Type yes to confirm.')) return;
+      try {{
+        let r = await fetch('/api/wipe', {{
+          method: 'POST',
+          headers: {{'Content-Type': 'application/json'}},
+          body: JSON.stringify({{confirm: 'yes'}})
+        }});
+        let d = await r.json();
+        alert('Wipe complete: ' + d.files_deleted + ' files deleted, DB deleted: ' + d.db_deleted + ', agent killed: ' + d.agent_killed);
+        window.location.reload();
+      }} catch(e) {{
+        alert('Wipe failed: ' + e.message);
+      }}
+    }}
+    </script>
     </div>'''
     return render('Settings', 'settings', body, dark)
 
@@ -992,9 +1035,15 @@ def api_message(msg_id):
         return jsonify({'error': 'Not found'}), 404
 
     if request.method == 'DELETE':
+        # Delete .asc file from disk if it exists
+        if row['file_path']:
+            asc_path = Path(row['file_path'])
+            if asc_path.exists():
+                try: asc_path.unlink()
+                except Exception: pass
         conn.execute('DELETE FROM messages WHERE id = ?', (msg_id,))
         conn.commit()
-        return jsonify({'deleted': msg_id})
+        return jsonify({'deleted': msg_id, 'file_deleted': bool(row['file_path'])})
 
     # GET — decrypt on demand
     plaintext, err, code = decrypt_text(row['encrypted_payload'])
@@ -1010,6 +1059,56 @@ def api_message(msg_id):
         'content_hash': row['content_hash'],
         'plaintext': plaintext,
     })
+
+# ─── Kill GPG Agent + Wipe ───────────────────────────────────────────────────
+
+@app.route('/api/wipe', methods=['POST'])
+def api_wipe():
+    """
+    Kill GPG agent, wipe all messages from DB, delete all reply*.asc files.
+    Requires {"confirm": "yes"} in body. Irreversible.
+    """
+    data = request.get_json(force=True) or {}
+    if data.get('confirm') != 'yes':
+        return jsonify({'error': 'Must pass {"confirm": "yes"} to confirm wipe'}), 400
+
+    results = {'agent_killed': False, 'files_deleted': 0, 'db_deleted': False, 'errors': []}
+
+    # Kill GPG agent
+    try:
+        subprocess.run(['gpgconf', '--kill', 'gpg-agent'], capture_output=True)
+        results['agent_killed'] = True
+    except Exception as e:
+        results['errors'].append(f'agent kill: {e}')
+
+    # Delete all reply*.asc files
+    try:
+        for f in PGP_DIR.glob('reply*.asc'):
+            f.unlink()
+            results['files_deleted'] += 1
+    except Exception as e:
+        results['errors'].append(f'file delete: {e}')
+
+    # Delete DB file
+    try:
+        if DB_PATH.exists():
+            DB_PATH.unlink()
+            results['db_deleted'] = True
+        # Also clear in-memory connection
+        if hasattr(threading.current_thread(), '_db'):
+            try: threading.current_thread()._db.close()
+            except: pass
+    except Exception as e:
+        results['errors'].append(f'db delete: {e}')
+
+    # Clear sent_log.json
+    try:
+        sl = PGP_DIR / 'sent_log.json'
+        if sl.exists(): sl.unlink()
+    except Exception as e:
+        results['errors'].append(f'sent_log delete: {e}')
+
+    return jsonify(results)
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 
