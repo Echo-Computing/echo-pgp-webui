@@ -2,17 +2,9 @@
 """
 PGP Web UI — standalone Flask interface for encrypt/decrypt operations.
 
-SANITIZED PUBLISH VERSION — replace identity placeholders before deploying.
-
+Echo Vault — echo@vault.local
 Run: python3 pgp_webui.py
 Opens: http://localhost:8765
-
-Configuration via environment variables:
-  PGP_DIR           Directory containing .asc key files and where reply*.asc are saved
-  PGP_WEBUI_PORT    Port to listen on (default: 8765)
-  PGP_SENDER_ID     Your sender identity — e.g. alice@vault.local (used as --local-user)
-  PGP_CLIPBOARD_CLEAR_SECONDS  Seconds before auto-clearing clipboard (default: 30)
-  PGP_MAX_ATTEMPTS  Max decryption failures before lockout (default: 5)
 """
 import logging
 import os
@@ -28,8 +20,8 @@ from datetime import datetime
 
 # ── Identity ─────────────────────────────────────────────────────────────────
 # REPLACE THESE with your actual identity before running
-SENDER_IDENTITY = os.environ.get('PGP_SENDER_ID', 'CHANGE_ME@vault.local')
-PGP_DIR = Path(os.environ.get('PGP_DIR', '.')).resolve()
+SENDER_IDENTITY = 'echo@vault.local'
+PGP_DIR = Path('D:/pgp')
 
 sys.path.insert(0, str(PGP_DIR))
 
@@ -414,14 +406,14 @@ def compose():
 
     confirm_row_enc = f'''
     <div class="form-row">
-      <label>Confirmation phrase {"" if guard_on else "(guard OFF)"}</label>
-      <input type="password" name="confirm_phrase" placeholder="{'vaultbot' if guard_on else 'guard is off'}">
+      <label for="confirm_phrase">Confirmation phrase {"" if guard_on else "(guard OFF)"}</label>
+      <input type="password" name="confirm_phrase" id="confirm_phrase" id="confirm_phrase" placeholder="{'vaultbot' if guard_on else 'guard is off'}">
     </div>''' if guard_on else ''
 
     confirm_row_dec = f'''
     <div class="form-row">
-      <label>Confirmation phrase {"" if guard_on else "(guard OFF)"}</label>
-      <input type="password" name="confirm_phrase_dec" placeholder="{'vaultbot' if guard_on else 'guard is off'}">
+      <label for="confirm_phrase_dec">Confirmation phrase {"" if guard_on else "(guard OFF)"}</label>
+      <input type="password" name="confirm_phrase_dec" id="confirm_phrase_dec" placeholder="{'vaultbot' if guard_on else 'guard is off'}">
     </div>''' if guard_on else ''
 
     body = f'''
@@ -432,15 +424,15 @@ def compose():
     <form method="post">
       <input type="hidden" name="action" value="encrypt">
       <div class="form-row">
-        <label>Recipient (encrypt TO)</label>
-        <select name="recipient">
+        <label for="recipient">Recipient (encrypt TO)</label>
+        <select name="recipient" id="recipient">
           <option value="">— select recipient —</option>
           {' '.join(f'<option value="{r}">{r}</option>' for r in recipients)}
         </select>
       </div>
       <div class="form-row">
-        <label>Plaintext message</label>
-        <textarea name="message" placeholder="Your message..."></textarea>
+        <label for="message">Plaintext message</label>
+        <textarea name="message" id="message" placeholder="Your message..."></textarea>
       </div>
       {confirm_row_enc}
       <button type="submit" class="btn primary">🔒 Encrypt & Save</button>
@@ -451,15 +443,15 @@ def compose():
     <form method="post">
       <input type="hidden" name="action" value="decrypt">
       <div class="form-row">
-        <label>Secret key (decrypt WITH)</label>
-        <select name="local_user">
+        <label for="local_user">Secret key (decrypt WITH)</label>
+        <select name="local_user" id="local_user">
           <option value="">— auto-detect —</option>
           {' '.join(f'<option value="{u}">{u}</option>' for u in local_users)}
         </select>
       </div>
       <div class="form-row">
-        <label>Ciphertext</label>
-        <textarea name="ciphertext" placeholder="-----BEGIN PGP MESSAGE-----..."></textarea>
+        <label for="ciphertext">Ciphertext</label>
+        <textarea name="ciphertext" id="ciphertext" placeholder="-----BEGIN PGP MESSAGE-----..."></textarea>
       </div>
       {confirm_row_dec}
       <button type="submit" class="btn">🔓 Decrypt</button>
@@ -744,8 +736,8 @@ def keys_page():
     <form method="post">
       <input type="hidden" name="action" value="import">
       <div class="form-row">
-        <label>Public key block (-----BEGIN PGP PUBLIC KEY BLOCK-----)</label>
-        <textarea name="key_data" rows="8" placeholder="-----BEGIN PGP PUBLIC KEY BLOCK-----&#10;&#10;...&#10;-----END PGP PUBLIC KEY BLOCK-----"></textarea>
+        <label for="key_data">Public key block (-----BEGIN PGP PUBLIC KEY BLOCK-----)</label>
+        <textarea name="key_data" id="key_data" rows="8" placeholder="-----BEGIN PGP PUBLIC KEY BLOCK-----&#10;&#10;...&#10;-----END PGP PUBLIC KEY BLOCK-----"></textarea>
       </div>
       <button type="submit" class="btn primary">Import Key</button>
     </form>
