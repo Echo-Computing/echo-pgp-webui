@@ -537,15 +537,14 @@ def inbox():
     dark = request.cookies.get(DARK_MODE_COOKIE, '1') == '1'
     pgp_dir = app.config['PGP_DIR']
 
-    # Load from SQLite DB — get messages NOT from current sender (i.e. received messages)
+    # Load from SQLite DB — show all messages (DB stores all sent + received)
     conn = get_db()
     rows = conn.execute('''
         SELECT id, timestamp, sender, recipient, subject, file_path, content_hash
         FROM messages
-        WHERE sender != ?
         ORDER BY timestamp DESC
         LIMIT 50
-    ''', (SENDER_IDENTITY,)).fetchall()
+    ''').fetchall()
 
     messages = []
     for r in rows:
