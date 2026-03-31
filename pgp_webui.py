@@ -200,7 +200,7 @@ def encrypt_message(recipient, plaintext, armor=True, output=None):
     return result.stdout, result.stderr, result.returncode
 
 def list_public_keys():
-    out, err, code = run_gpg(['--keyid-format=long', '--list-keys'])
+    out, err, code = run_gpg(['--keyid-format=long', '--fixed-list-mode', '--list-keys'])
     return out
 
 def list_secret_keys():
@@ -936,27 +936,37 @@ def keys_page():
                     msg = f'<div class="alert error">Delete failed: {err}</div>'
 
     # Parse keys into structured display
-    # Output with --keyid-format=long looks like:
+    # Output with --keyid-format=long --fixed-list-mode looks like:
     #   pub   rsa4096/0FA4F517F1464254 2026-03-27 [SCEAR]
     #       DC0CD526AF3562D1C1C554706A14CEC641BE97C8  (40 hex chars, leading spaces stripped)
-    #   uid                 [ultimate] User <user@email>
+    #   uid          [ultimate] User <user@email>
+    #   sub   rsa4096/SUBKEY 2026-03-27 [SCE] [expires: 2027-03-27]
     keys = []
     current_key = {}
     for i, line in enumerate(keys_raw.splitlines()):
         stripped = line.lstrip()
-        if stripped.startswith('pub'):
+        if stripped.startswith('pub') or stripped.startswith('sec'):
             if current_key:
                 keys.append(current_key)
             parts = stripped.split()
             keyid = next((p for p in parts if '/' in p), '')
-            current_key = {'keyid': keyid, 'fingerprint': '', 'uids': []}
-            # Next line may be the fingerprint (40 hex chars with possible spaces)
+            current_key = {'keyid': keyid, 'fingerprint': '', 'uids': [], 'expires': ''}
+            # Check for expiry on pub/sec line
+            m = re.search(r'\[expires:\s*(\d{4}-\d{2}-\d{2})\]', stripped)
+            if m:
+                current_key['expires'] = m.group(1)
+            # Next line may be the fingerprint (40 hex chars, leading spaces stripped)
             if i + 1 < len(keys_raw.splitlines()):
                 next_line = keys_raw.splitlines()[i + 1]
                 next_stripped = next_line.lstrip()
                 hex_clean = next_stripped.replace(' ', '')
                 if len(hex_clean) >= 32 and all(c in '0123456789ABCDEFabcdef' for c in hex_clean[:32]):
                     current_key['fingerprint'] = hex_clean
+        elif stripped.startswith('sub'):
+            # Expiry may also appear on sub key line
+            m = re.search(r'\[expires:\s*(\d{4}-\d{2}-\d{2})\]', stripped)
+            if m and current_key and not current_key.get('expires'):
+                current_key['expires'] = m.group(1)
         elif stripped.startswith('uid') and current_key:
             m = re.search(r'<([^>]+)>', stripped)
             current_key['uids'].append(m.group(1) if m else stripped.strip())
@@ -973,7 +983,7 @@ def keys_page():
     </p>
     <table style="width:100%;border-collapse:collapse">
       <tr style="text-align:left;color:#8b949e">
-        <th>Key ID</th><th>Fingerprint</th><th>User IDs</th><th></th>
+        <th>Key ID</th><th>Fingerprint</th><th>User IDs</th><th>Expiry</th><th></th>
       </tr>'''
     for k in keys:
         fprint = k.get('fingerprint', '')
@@ -981,11 +991,29 @@ def keys_page():
         # Use fingerprint (full or last 16 chars) as the deletable key identifier
         short_id = fprint[-16:] if fprint else k.get('keyid', '')
         delete_key = fprint if fprint else short_id
-        body += f'''
+        # Build expiry badge for each key
+    expiry_badge = ''
+    if k.get('expires'):
+        from datetime import date
+        try:
+            exp_date = date.fromisoformat(k['expires'])
+            today = date.today()
+            days_left = (exp_date - today).days
+            if days_left < 0:
+                badge_color = '#f85149'; badge_text = f'expired {abs(days_left)}d ago'
+            elif days_left <= 30:
+                badge_color = '#d29922'; badge_text = f'expires in {days_left}d'
+            else:
+                badge_color = '#3fb950'; badge_text = f'expires {k["expires"]}'
+            expiry_badge = f'<span style="background:#1c2128;color:{badge_color};border:1px solid {badge_color};border-radius:4px;padding:1px 6px;font-size:0.75rem">{badge_text}</span>'
+        except Exception:
+            expiry_badge = f'<span style="color:#8b949e">{k["expires"]}</span>'
+    body += f'''
       <tr style="border-bottom:1px solid #21262d">
         <td style="padding:0.5rem;font-family:monospace">{short_id}</td>
         <td style="padding:0.5rem;font-family:monospace;font-size:0.75rem">{fprint}</td>
         <td style="padding:0.5rem">{uid_str}</td>
+        <td style="padding:0.5rem">{expiry_badge}</td>
         <td style="padding:0.5rem">
           <form method="post" style="display:inline">
             <input type="hidden" name="action" value="delete">
