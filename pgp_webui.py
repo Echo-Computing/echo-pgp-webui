@@ -1098,8 +1098,9 @@ def keys_page():
             if m and current_key and not current_key.get('expires'):
                 current_key['expires'] = m.group(1)
         elif stripped.startswith('uid') and current_key:
+            # Extract full UID string (not just email), preserving full format like "Name <email@domain>"
             m = re.search(r'<([^>]+)>', stripped)
-            current_key['uids'].append(m.group(1) if m else stripped.strip())
+            current_key['uids'].append(m.group(0) if m else stripped.strip())
     if current_key:
         keys.append(current_key)
 
