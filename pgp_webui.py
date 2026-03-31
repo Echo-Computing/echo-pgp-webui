@@ -383,7 +383,7 @@ BASE_TEMPLATE = """
     {{ css | safe }}
   </style>
 </head>
-<body>
+<body data-dark="{{ '1' if dark_mode else '0' }}">
 <div class="container">
 <header>
   <h1>🔐 PGP Vault</h1>
@@ -391,11 +391,24 @@ BASE_TEMPLATE = """
     {% for endpoint, label in tabs %}
     <a href="{{ url_for(endpoint) }}" class="{{ 'active' if active_tab == endpoint else '' }}">{{ label }}</a>
     {% endfor %}
-    <form method="post" action="{{ url_for('toggle_dark_mode') }}" style="display:inline">
-      <button type="submit" id="dark_toggle" style="background:none;border:none;color:#8b949e;cursor:pointer;font-size:0.8rem;">{{ '☀ light' if dark_mode else '🌙 dark' }}</button>
-    </form>
+    <a href="#" id="dark_toggle" onclick="toggleDark(); return false;" style="background:none;border:none;color:#8b949e;cursor:pointer;font-size:0.8rem;text-decoration:none">{{ '☀ light' if dark_mode else '🌙 dark' }}</a>
   </div>
 </header>
+<style id="theme-css">* { box-sizing: border-box; margin: 0; padding: 0; }
+{{ css | safe }}</style>
+<script>
+function toggleDark() {{
+  let isDark = document.body.getAttribute('data-dark') === '1';
+  let newDark = isDark ? '0' : '1';
+  document.body.setAttribute('data-dark', newDark);
+  document.getElementById('dark_toggle').textContent = newDark === '1' ? '☀ light' : '🌙 dark';
+  // Swap CSS instantly without reload
+  let cssEl = document.getElementById('theme-css');
+  cssEl.innerHTML = '* {{ box-sizing: border-box; margin: 0; padding: 0; }}\\n' + (newDark === '1' ? {{ DARK_CSS | tojson }} : {{ LIGHT_CSS | tojson }});
+  // Persist via cookie POST
+  fetch('{{ url_for("toggle_dark_mode") }}', {{method:'POST', headers:{{'Content-Type':'application/x-www-form-urlencoded'}}, body:'dark=' + newDark}}).catch(()=>{{}});
+}}
+</script>
 {{ body | safe }}
 </div>
 </body>
