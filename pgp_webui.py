@@ -214,8 +214,15 @@ def list_secret_keys():
 
 def import_public_key(key_data: str) -> tuple[str, str, int]:
     """Import a public key block. Returns (stdout, stderr, returncode)."""
+    # Normalize: remove only trailing \r\n, preserve leading whitespace and armor structure
+    key_data = key_data.rstrip('\r\n')
+    # Ensure blank line before armor header (some paste jobs lose it)
+    armor = key_data.lstrip()
+    leading = key_data[:len(key_data) - len(armor)]
+    if armor.startswith('-----BEGIN') and not leading.endswith('\n\n'):
+        key_data = '\n' + key_data
     tmp = app.config['PGP_DIR'] / f'.tmp_import_{int(time.time())}.asc'
-    tmp.write_text(key_data.strip())
+    tmp.write_text(key_data)
     out, err, code = run_gpg(['--import', str(tmp)])
     try:
         tmp.unlink()
