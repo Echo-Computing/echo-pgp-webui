@@ -178,7 +178,7 @@ def encrypt_message(recipient, plaintext, armor=True, output=None):
     if armor:
         args.append('--armor')
     args += ['--recipient', recipient, '--local-user', app.config['SENDER_IDENTITY']]
-    kwargs = {'capture_output': True, 'text': True, 'input': plaintext}
+    kwargs = {'capture_output': True, 'encoding': 'utf-8', 'input': plaintext}
     result = subprocess.run([GPG_BIN] + args, **kwargs)
     if result.returncode == 0 and output:
         Path(output).write_text(result.stdout)
