@@ -905,7 +905,9 @@ def keys_page():
             if current_key:
                 keys.append(current_key)
             parts = line.split()
-            current_key = {'line': line, 'keyid': parts[-1] if parts else '', 'uids': []}
+            # Key ID is the part containing '/' (e.g. rsa4096/6A14CEC641BE97C8)
+            keyid = next((p for p in parts if '/' in p), parts[-1] if parts else '')
+            current_key = {'line': line, 'keyid': keyid, 'uids': []}
         elif line.startswith('uid'):
             m = re.search(r'<([^>]+)>', line)
             current_key['uids'].append(m.group(1) if m else line.strip())
