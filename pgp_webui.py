@@ -624,6 +624,7 @@ def inbox():
         html_rows += f'''<tr>
           <td><code>{m['file']}</code></td>
           <td>{m.get('sender','')}</td>
+          <td>{m.get('subject','')[:40]}</td>
           <td>{m.get('timestamp','')[:16]}</td>
           <td>
             <button class="btn" onclick="decryptFile('{m['file']}', this)">🔓 Decrypt</button>
@@ -632,7 +633,7 @@ def inbox():
           </td>
         </tr>
         <tr class="decrypted-row" id="row-{m['file']}" style="display:none">
-          <td colspan="4"><div class="decrypted-content" id="content-{m['file']}"></div></td>
+          <td colspan="5"><div class="decrypted-content" id="content-{m['file']}"></div></td>
         </tr>'''
 
     body = f'''
@@ -643,7 +644,7 @@ def inbox():
     </style>
     {f'<div class="alert info">{len(messages)} messages — lazy decrypt: click to reveal</div>' if messages else f'<div class="alert info">No messages found</div>'}
     <div class="card"><h2>Inbox</h2>
-    <table><thead><tr><th>File</th><th>From</th><th>Time</th><th>Actions</th></tr></thead>
+    <table><thead><tr><th>File</th><th>From</th><th>Subject</th><th>Time</th><th>Actions</th></tr></thead>
     <tbody>{html_rows}</tbody></table>
     </div>
     <script>
