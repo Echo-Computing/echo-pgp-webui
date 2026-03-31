@@ -454,6 +454,16 @@ def compose():
                 out_path = app.config['PGP_DIR'] / f'reply{reply_num}.asc'
                 out, err, code = encrypt_message(recipient, msg, armor=True, output=out_path)
                 if code == 0:
+                    # Save to messages.db (source of truth)
+                    content = out_path.read_text(errors='replace')
+                    h = hashlib.sha256(content.encode()).hexdigest()
+                    db_conn = get_db()
+                    db_conn.execute('''
+                        INSERT INTO messages (timestamp, sender, recipient, subject, file_path, content_hash, encrypted_payload, direction)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, 'sent')
+                    ''', (datetime.utcnow().isoformat(), SENDER_IDENTITY, recipient, '', str(out_path), h, content))
+                    db_conn.commit()
+                    # Update sent_log.json for backwards compat
                     log_path = app.config['PGP_DIR'] / 'sent_log.json'
                     log = []
                     if log_path.exists():
