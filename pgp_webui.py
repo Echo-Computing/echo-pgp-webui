@@ -429,6 +429,7 @@ def index():
 @app.route('/compose', methods=['GET', 'POST'])
 def compose():
     dark = request.cookies.get(DARK_MODE_COOKIE, '1') == '1'
+    reply_to = request.args.get('reply_to', '').strip()
     keys_raw = list_public_keys()
     recipients = []
     for line in keys_raw.splitlines():
@@ -524,7 +525,7 @@ def compose():
         <label for="recipient">Recipient (encrypt TO)</label>
         <select name="recipient" id="recipient">
           <option value="">— select recipient —</option>
-          {' '.join(f'<option value="{r}">{r}</option>' for r in recipients)}
+          {' '.join(f'<option value="{r}"{" selected" if r == reply_to else ""}>{r}</option>' for r in recipients)}
         </select>
       </div>
       <div class="form-row">
@@ -628,6 +629,7 @@ def inbox():
           <td>{m.get('timestamp','')[:16]}</td>
           <td>
             <button class="btn" onclick="decryptFile('{m['file']}', this)">🔓 Decrypt</button>
+            <button class="btn" onclick="window.location='/compose?reply_to={m.get('sender','')}'">↩ Reply</button>
             <button class="btn" onclick="copyFile('{m['file']}', this)">📋 Copy</button>
             {delete_btn}
           </td>
