@@ -541,18 +541,22 @@ def compose():
       <input type="hidden" name="action" value="encrypt">
       <div class="form-row">
         <label for="recipient">Recipient (encrypt TO)</label>
-        <select name="recipient" id="recipient">
+        <select name="recipient" id="recipient" onchange="saveDraft()">
           <option value="">— select recipient —</option>
           {' '.join(f'<option value="{r}"{" selected" if r == reply_to else ""}>{r}</option>' for r in recipients)}
         </select>
       </div>
       <div class="form-row">
         <label for="subject">Subject <span style="font-weight:normal">(optional)</span></label>
-        <input type="text" name="subject" id="subject" placeholder="Brief description of this message…">
+        <input type="text" name="subject" id="subject" placeholder="Brief description of this message…" oninput="saveDraft()">
       </div>
       <div class="form-row">
-        <label for="message">Plaintext message</label>
-        <textarea name="message" id="message" placeholder="Your message..."></textarea>
+        <label for="message">Plaintext message <span id="draftIndicator" style="color:#8b949e;font-weight:normal;font-size:0.8rem;display:none"> · Draft saved</span></label>
+        <textarea name="message" id="message" placeholder="Your message..." oninput="saveDraft()"></textarea>
+      </div>
+      <div class="form-row" style="margin-top:-0.5rem">
+        <label></label>
+        <span style="color:#8b949e;font-size:0.75rem">Draft auto-saved locally</span>
       </div>
       {confirm_row_enc}
       <button type="submit" class="btn primary">🔒 Encrypt & Save</button>
@@ -579,6 +583,43 @@ def compose():
     </div>
     </div>
     {output}'''
+    # Draft auto-save/restore via localStorage
+    body += '''
+    <script>
+    const DRAFT_KEY = 'pgp_compose_draft';
+    function saveDraft() {{
+      let draft = {{
+        recipient: document.getElementById('recipient') ? document.getElementById('recipient').value : '',
+        subject: document.getElementById('subject') ? document.getElementById('subject').value : '',
+        message: document.getElementById('message') ? document.getElementById('message').value : ''
+      }};
+      localStorage.setItem(DRAFT_KEY, JSON.stringify(draft));
+      let ind = document.getElementById('draftIndicator');
+      if (ind) {{ ind.style.display = ''; }}
+    }}
+    function loadDraft() {{
+      try {{
+        let raw = localStorage.getItem(DRAFT_KEY);
+        if (!raw) return;
+        let draft = JSON.parse(raw);
+        let msgEl = document.getElementById('message');
+        if (draft.message && msgEl && !msgEl.value) {{ msgEl.value = draft.message; }}
+        let subEl = document.getElementById('subject');
+        if (draft.subject && subEl && !subEl.value) {{ subEl.value = draft.subject; }}
+        // Restore recipient (select element — find matching option)
+        let recEl = document.getElementById('recipient');
+        if (draft.recipient && recEl) {{
+          for (let o of recEl.options) {{ if (o.value === draft.recipient) {{ recEl.value = draft.recipient; break; }} }}
+        }}
+      }} catch(e) {{}}
+    }}
+    function clearDraft() {{ localStorage.removeItem(DRAFT_KEY); }}
+    // Clear draft on successful encrypt submit
+    document.querySelector('form').addEventListener('submit', function(e) {{
+      if (e.submitter && e.submitter.textContent.includes('Encrypt')) clearDraft();
+    }});
+    window.addEventListener('DOMContentLoaded', loadDraft);
+    </script>'''
     return render('Compose', 'compose', body, dark)
 
 @app.route('/inbox')
