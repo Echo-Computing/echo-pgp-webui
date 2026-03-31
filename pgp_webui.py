@@ -65,6 +65,7 @@ app.config['PGP_DIR'] = PGP_DIR
 app.config['SENDER_IDENTITY'] = SENDER_IDENTITY
 app.config['DB_PATH'] = DB_PATH
 
+# TEMP DEBUG ROUTE — remove after diagnosis
 # ─── SQLite Storage ──────────────────────────────────────────────────────────
 
 def get_db() -> sqlite3.Connection:
@@ -212,16 +213,23 @@ def list_secret_keys():
     out, err, code = run_gpg(['--keyid-format=long', '--list-secret-keys'])
     return out
 
-def import_public_key(key_data: str) -> tuple[str, int]:
-    """Import a public key block. Returns (output, returncode)."""
+def import_public_key(key_data: str) -> tuple[str, str, int]:
+    """Import a public key block. Returns (stdout, stderr, returncode)."""
+    # Normalize: remove only trailing \r\n, preserve leading whitespace and armor structure
+    key_data = key_data.rstrip('\r\n')
+    # Ensure blank line before armor header (some paste jobs lose it)
+    armor = key_data.lstrip()
+    leading = key_data[:len(key_data) - len(armor)]
+    if armor.startswith('-----BEGIN') and not leading.endswith('\n\n'):
+        key_data = '\n' + key_data
     tmp = app.config['PGP_DIR'] / f'.tmp_import_{int(time.time())}.asc'
-    tmp.write_text(key_data.strip())
+    tmp.write_text(key_data)
     out, err, code = run_gpg(['--import', str(tmp)])
     try:
         tmp.unlink()
     except Exception:
         pass
-    return out, code
+    return out, err, code
 
 def gpg_agent_status():
     out, err, code = run_gpg(['--list-keys'])
@@ -386,9 +394,9 @@ BASE_TEMPLATE = """
 <head>
   <meta charset="utf-8">
   <title>{{ title }} — PGP Vault</title>
-  <style>
+  <style id="theme-css">
     * { box-sizing: border-box; margin: 0; padding: 0; }
-    {{ css | safe }}
+    {{ page_css | safe }}
   </style>
 </head>
 <body data-dark="{{ '1' if dark_mode else '0' }}">
@@ -402,29 +410,31 @@ BASE_TEMPLATE = """
     <a href="#" id="dark_toggle" onclick="toggleDark(); return false;" style="background:none;border:none;color:#8b949e;cursor:pointer;font-size:0.8rem;text-decoration:none">{{ '☀ light' if dark_mode else '🌙 dark' }}</a>
   </div>
 </header>
-<style id="theme-css">* { box-sizing: border-box; margin: 0; padding: 0; }
-{{ css | safe }}</style>
 <script>
-function toggleDark() {{
-  let isDark = document.body.getAttribute('data-dark') === '1';
-  let newDark = isDark ? '0' : '1';
-  document.body.setAttribute('data-dark', newDark);
-  document.getElementById('dark_toggle').textContent = newDark === '1' ? '☀ light' : '🌙 dark';
-  // Swap CSS instantly without reload
-  let cssEl = document.getElementById('theme-css');
-  cssEl.innerHTML = '* {{ box-sizing: border-box; margin: 0; padding: 0; }}\\n' + (newDark === '1' ? {{ DARK_CSS | tojson }} : {{ LIGHT_CSS | tojson }});
-  // Persist via cookie POST
-  fetch('{{ url_for("toggle_dark_mode") }}', {{method:'POST', headers:{{'Content-Type':'application/x-www-form-urlencoded'}}, body:'dark=' + newDark}}).catch(()=>{{}});
-}}
+window.__DARK_CSS__ = {{ dark_css | tojson }};
+window.__LIGHT_CSS__ = {{ light_css | tojson }};
+function toggleDark() {
+  var isDark = document.body.getAttribute("data-dark") === "1";
+  var newDark = isDark ? "0" : "1";
+  document.body.setAttribute("data-dark", newDark);
+  document.getElementById("dark_toggle").textContent = newDark === "1" ? "☀ light" : "🌙 dark";
+  document.getElementById("theme-css").textContent = newDark === "1" ? window.__DARK_CSS__ : window.__LIGHT_CSS__;
+  fetch("{{ url_for('toggle_dark_mode') }}", {method:"POST", headers:{"Content-Type":"application/x-www-form-urlencoded"}, body:"dark="+newDark}).catch(function(){});
+}
 </script>
 {{ body | safe }}
 </div>
+<script>
+var tc=document.getElementById('theme-css');
+if(tc)tc.textContent=tc.textContent.replace(//g,'{').replace(//g,'}');
+</script>
 </body>
 </html>
 """
 
 def render(title, active_tab, body_html, dark_mode=True, set_cookie=False):
-    css = DARK_CSS if dark_mode else LIGHT_CSS
+    css_raw = DARK_CSS if dark_mode else LIGHT_CSS
+    css_safe = css_raw.replace('{', '\x01').replace('}', '\x02')
     tab_links = [
         ('compose', 'Compose'),
         ('inbox', 'Inbox'),
@@ -438,7 +448,9 @@ def render(title, active_tab, body_html, dark_mode=True, set_cookie=False):
         tabs=tab_links,
         active_tab=active_tab,
         dark_mode=dark_mode,
-        css=css,
+        dark_css=DARK_CSS,
+        light_css=LIGHT_CSS,
+        page_css=css_safe,
         url_for=url_for,
     )
     resp = app.make_response(html)
@@ -1033,12 +1045,15 @@ def keys_page():
         if action == 'import':
             key_data = request.form.get('key_data', '').strip()
             if key_data:
-                out, code = import_public_key(key_data)
+                out, err, code = import_public_key(key_data)
                 if code == 0:
-                    msg = '<div class="alert success">Key imported successfully!</div>'
+                    if 'not changed' in out or 'not changed' in err:
+                        msg = '<div class="alert info">Key already imported (no changes).</div>'
+                    else:
+                        msg = '<div class="alert success">Key imported successfully!</div>'
                     keys_raw = list_public_keys()  # refresh
                 else:
-                    msg = f'<div class="alert error">Import failed: {out}</div>'
+                    msg = f'<div class="alert error">Import failed: {err or out}</div>'
         elif action == 'delete':
             key_id = request.form.get('key_id', '').strip()
             if key_id:
@@ -1065,7 +1080,10 @@ def keys_page():
             if current_key:
                 keys.append(current_key)
             parts = stripped.split()
-            keyid = next((p for p in parts if '/' in p), '')
+            # keyid is the algo/size prefix (e.g. rsa4096/) + key fingerprint suffix
+            keyid = next((p for p in parts if p.startswith('rsa') or p.startswith('dsa') or p.startswith('elg') or p.startswith('ecc')), '')
+            if '/' in keyid:
+                keyid = keyid.split('/')[-1]  # just the hex ID, not the algo prefix
             current_key = {'keyid': keyid, 'fingerprint': '', 'uids': [], 'expires': ''}
             # Check for expiry on pub/sec line
             m = re.search(r'\[expires:\s*(\d{4}-\d{2}-\d{2})\]', stripped)
@@ -1084,8 +1102,12 @@ def keys_page():
             if m and current_key and not current_key.get('expires'):
                 current_key['expires'] = m.group(1)
         elif stripped.startswith('uid') and current_key:
-            m = re.search(r'<([^>]+)>', stripped)
-            current_key['uids'].append(m.group(1) if m else stripped.strip())
+            # Extract full UID string (not just email), preserving full format like "Name <email@domain>"
+            m = re.search(r'^(.*?)<([^>]+)>', stripped)
+            if m:
+                current_key['uids'].append(f'{m.group(1)} <{m.group(2)}>')
+            else:
+                current_key['uids'].append(stripped.strip())
     if current_key:
         keys.append(current_key)
 
@@ -1108,23 +1130,23 @@ def keys_page():
         short_id = fprint[-16:] if fprint else k.get('keyid', '')
         delete_key = fprint if fprint else short_id
         # Build expiry badge for each key
-    expiry_badge = ''
-    if k.get('expires'):
-        from datetime import date
-        try:
-            exp_date = date.fromisoformat(k['expires'])
-            today = date.today()
-            days_left = (exp_date - today).days
-            if days_left < 0:
-                badge_color = '#f85149'; badge_text = f'expired {abs(days_left)}d ago'
-            elif days_left <= 30:
-                badge_color = '#d29922'; badge_text = f'expires in {days_left}d'
-            else:
-                badge_color = '#3fb950'; badge_text = f'expires {k["expires"]}'
-            expiry_badge = f'<span style="background:#1c2128;color:{badge_color};border:1px solid {badge_color};border-radius:4px;padding:1px 6px;font-size:0.75rem">{badge_text}</span>'
-        except Exception:
-            expiry_badge = f'<span style="color:#8b949e">{k["expires"]}</span>'
-    body += f'''
+        expiry_badge = ''
+        if k.get('expires'):
+            from datetime import date
+            try:
+                exp_date = date.fromisoformat(k['expires'])
+                today = date.today()
+                days_left = (exp_date - today).days
+                if days_left < 0:
+                    badge_color = '#f85149'; badge_text = f'expired {abs(days_left)}d ago'
+                elif days_left <= 30:
+                    badge_color = '#d29922'; badge_text = f'expires in {days_left}d'
+                else:
+                    badge_color = '#3fb950'; badge_text = f'expires {k["expires"]}'
+                expiry_badge = f'<span style="background:#1c2128;color:{badge_color};border:1px solid {badge_color};border-radius:4px;padding:1px 6px;font-size:0.75rem">{badge_text}</span>'
+            except Exception:
+                expiry_badge = f'<span style="color:#8b949e">{k["expires"]}</span>'
+        body += f'''
       <tr style="border-bottom:1px solid #21262d">
         <td style="padding:0.5rem;font-family:monospace">{short_id}</td>
         <td style="padding:0.5rem;font-family:monospace;font-size:0.75rem">{fprint}</td>
