@@ -461,7 +461,7 @@ def compose():
                     db_conn.execute('''
                         INSERT INTO messages (timestamp, sender, recipient, subject, file_path, content_hash, encrypted_payload, direction)
                         VALUES (?, ?, ?, ?, ?, ?, ?, 'sent')
-                    ''', (datetime.utcnow().isoformat(), SENDER_IDENTITY, recipient, '', str(out_path), h, content))
+                    ''', (datetime.utcnow().isoformat(), SENDER_IDENTITY, recipient, request.form.get('subject', ''), str(out_path), h, content))
                     db_conn.commit()
                     # Update sent_log.json for backwards compat
                     log_path = app.config['PGP_DIR'] / 'sent_log.json'
@@ -526,6 +526,10 @@ def compose():
           <option value="">— select recipient —</option>
           {' '.join(f'<option value="{r}">{r}</option>' for r in recipients)}
         </select>
+      </div>
+      <div class="form-row">
+        <label for="subject">Subject <span style="font-weight:normal">(optional)</span></label>
+        <input type="text" name="subject" id="subject" placeholder="Brief description of this message…">
       </div>
       <div class="form-row">
         <label for="message">Plaintext message</label>
