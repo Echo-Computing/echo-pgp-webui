@@ -68,6 +68,7 @@ app.config['DB_PATH'] = DB_PATH
 def get_db() -> sqlite3.Connection:
     """Get thread-local DB connection."""
     if not hasattr(threading.current_thread(), '_db'):
+        DB_PATH.parent.mkdir(parents=True, exist_ok=True)
         conn = sqlite3.connect(str(DB_PATH), check_same_thread=False)
         conn.row_factory = sqlite3.Row
         _init_db_schema(conn)
