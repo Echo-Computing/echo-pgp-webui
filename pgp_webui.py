@@ -90,12 +90,25 @@ def _init_db_schema(conn: sqlite3.Connection):
             content_hash TEXT NOT NULL,
             verified INTEGER DEFAULT 0,
             encrypted_payload TEXT NOT NULL,
+            direction TEXT DEFAULT 'unknown',
             created_at TEXT DEFAULT (datetime('now'))
         )
     ''')
     conn.execute('CREATE INDEX IF NOT EXISTS idx_recipient ON messages(recipient)')
     conn.execute('CREATE INDEX IF NOT EXISTS idx_timestamp ON messages(timestamp)')
     conn.execute('CREATE INDEX IF NOT EXISTS idx_sender ON messages(sender)')
+    # Add direction column if missing (existing DBs won't have it)
+    try:
+        conn.execute("ALTER TABLE messages ADD COLUMN direction TEXT DEFAULT 'unknown'")
+    except Exception:
+        pass  # column already exists in newer DBs
+    conn.execute('CREATE INDEX IF NOT EXISTS idx_direction ON messages(direction)')
+    # Backfill direction for existing entries that don't have it
+    try:
+        conn.execute("UPDATE messages SET direction='sent' WHERE direction='unknown' AND sender=?",
+                     (SENDER_IDENTITY,))
+    except Exception:
+        pass
     conn.commit()
 
 def _import_sent_log() -> int:
@@ -120,8 +133,8 @@ def _import_sent_log() -> int:
             h = hashlib.sha256(content.encode()).hexdigest()
             conn.execute('''
                 INSERT OR IGNORE INTO messages
-                    (timestamp, sender, recipient, subject, file_path, content_hash, encrypted_payload)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                    (timestamp, sender, recipient, subject, file_path, content_hash, encrypted_payload, direction)
+                VALUES (?, ?, ?, ?, ?, ?, ?, 'sent')
             ''', (e.get('timestamp', ''), SENDER_IDENTITY, e.get('recipient', ''),
                   '', str(fp), h, content))
             count += 1
@@ -1017,8 +1030,8 @@ def api_messages():
     content = out_path.read_text(errors='replace')
     h = hashlib.sha256(content.encode()).hexdigest()
     cursor = conn.execute('''
-        INSERT INTO messages (timestamp, sender, recipient, subject, file_path, content_hash, encrypted_payload)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO messages (timestamp, sender, recipient, subject, file_path, content_hash, encrypted_payload, direction)
+        VALUES (?, ?, ?, ?, ?, ?, ?, 'sent')
     ''', (datetime.utcnow().isoformat(), SENDER_IDENTITY, recipient, subject, str(out_path), h, content))
     conn.commit()
 
