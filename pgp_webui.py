@@ -102,6 +102,11 @@ def _init_db_schema(conn: sqlite3.Connection):
         conn.execute("ALTER TABLE messages ADD COLUMN direction TEXT DEFAULT 'unknown'")
     except Exception:
         pass  # column already exists in newer DBs
+    # Add read column if missing
+    try:
+        conn.execute("ALTER TABLE messages ADD COLUMN read INTEGER DEFAULT 0")
+    except Exception:
+        pass  # column already exists
     conn.execute('CREATE INDEX IF NOT EXISTS idx_direction ON messages(direction)')
     # Backfill direction for existing entries that don't have it
     try:
@@ -571,7 +576,7 @@ def inbox():
     # Load from SQLite DB — show all messages (DB stores all sent + received)
     conn = get_db()
     rows = conn.execute('''
-        SELECT id, timestamp, sender, recipient, subject, file_path, content_hash
+        SELECT id, timestamp, sender, recipient, subject, file_path, content_hash, "read"
         FROM messages
         ORDER BY timestamp DESC
         LIMIT 50
@@ -588,6 +593,7 @@ def inbox():
             'recipient': r['recipient'],
             'subject': r['subject'],
             'size': fp.stat().st_size if fp and fp.exists() else 0,
+            'read': r.get('read', 0),
         })
 
     # Fallback: scan disk for .asc files not yet in DB (backwards compat)
@@ -622,9 +628,11 @@ def inbox():
         trash = '🗑'
         delete_btn = f'<button class="btn danger" onclick="deleteMsg({m["id"]}, this)">{trash} Delete</button>' if has_id else \
                      f'<button class="btn danger" onclick="deleteFile(\'{m["file"]}\', this)">{trash} Delete</button>'
-        html_rows += f'''<tr data-id="{m['id']}">
+        row_style = '' if m.get('read') else 'font-weight:bold'
+        read_icon = '✓ ' if m.get('read') else ''
+        html_rows += f'''<tr data-id="{m['id']}" style="{row_style}">
           <td style="text-align:center"><input type="checkbox" class="row-check" value="{m["id"]}" onclick="updateBulkBtn()"></td>
-          <td><code>{m['file']}</code></td>
+          <td><code>{read_icon}{m['file']}</code></td>
           <td>{m.get('sender','')}</td>
           <td>{m.get('subject','')[:40]}</td>
           <td>{m.get('timestamp','')[:16]}</td>
@@ -715,7 +723,15 @@ def inbox():
         let resp = await fetch('/inbox/decrypt_file/' + encodeURIComponent(filename));
         let data = await resp.json();
         if (data.error) {{ content.innerHTML='<div class="alert error">'+data.error+'</div>'; }}
-        else {{ content.textContent = data.plaintext; }}
+        else {{ content.textContent = data.plaintext;
+          // Mark as read: remove bold, add checkmark, fire PATCH silently
+          let tr = btn.closest('tr');
+          let id = tr.getAttribute('data-id');
+          tr.style.fontWeight = '';
+          let fileCell = tr.cells[1];
+          if (fileCell) {{ let code = fileCell.querySelector('code'); if (code && !code.textContent.startsWith('✓ ')) code.textContent = '✓ ' + filename; }}
+          if (id) fetch('/api/messages/' + id + '/read', {{method:'PATCH'}}).catch(()=>{{}});
+        }}
         row.style.display='table-row'; btn.textContent='🔒 Hide';
       }} catch(e) {{ content.innerHTML='<div class="alert error">'+e.message+'</div>'; row.style.display='table-row'; }}
     }}
@@ -1206,6 +1222,11 @@ def api_message(msg_id):
         conn.execute('DELETE FROM messages WHERE id = ?', (msg_id,))
         conn.commit()
         return jsonify({'deleted': msg_id, 'file_deleted': bool(row['file_path'])})
+
+    if request.method == 'PATCH':
+        conn.execute('UPDATE messages SET "read" = 1 WHERE id = ?', (msg_id,))
+        conn.commit()
+        return jsonify({'id': msg_id, 'read': 1})
 
     # GET — decrypt on demand
     plaintext, err, code = decrypt_text(row['encrypted_payload'])
