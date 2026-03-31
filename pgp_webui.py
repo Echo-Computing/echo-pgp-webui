@@ -386,9 +386,9 @@ BASE_TEMPLATE = """
 <head>
   <meta charset="utf-8">
   <title>{{ title }} — PGP Vault</title>
-  <style>
+  <style id="theme-css">
     * { box-sizing: border-box; margin: 0; padding: 0; }
-    {{ css | safe }}
+    {{ page_css | safe }}
   </style>
 </head>
 <body data-dark="{{ '1' if dark_mode else '0' }}">
@@ -402,29 +402,31 @@ BASE_TEMPLATE = """
     <a href="#" id="dark_toggle" onclick="toggleDark(); return false;" style="background:none;border:none;color:#8b949e;cursor:pointer;font-size:0.8rem;text-decoration:none">{{ '☀ light' if dark_mode else '🌙 dark' }}</a>
   </div>
 </header>
-<style id="theme-css">* { box-sizing: border-box; margin: 0; padding: 0; }
-{{ css | safe }}</style>
 <script>
-function toggleDark() {{
-  let isDark = document.body.getAttribute('data-dark') === '1';
-  let newDark = isDark ? '0' : '1';
-  document.body.setAttribute('data-dark', newDark);
-  document.getElementById('dark_toggle').textContent = newDark === '1' ? '☀ light' : '🌙 dark';
-  // Swap CSS instantly without reload
-  let cssEl = document.getElementById('theme-css');
-  cssEl.innerHTML = '* {{ box-sizing: border-box; margin: 0; padding: 0; }}\\n' + (newDark === '1' ? {{ DARK_CSS | tojson }} : {{ LIGHT_CSS | tojson }});
-  // Persist via cookie POST
-  fetch('{{ url_for("toggle_dark_mode") }}', {{method:'POST', headers:{{'Content-Type':'application/x-www-form-urlencoded'}}, body:'dark=' + newDark}}).catch(()=>{{}});
-}}
+window.__DARK_CSS__ = {{ dark_css | tojson }};
+window.__LIGHT_CSS__ = {{ light_css | tojson }};
+function toggleDark() {
+  var isDark = document.body.getAttribute("data-dark") === "1";
+  var newDark = isDark ? "0" : "1";
+  document.body.setAttribute("data-dark", newDark);
+  document.getElementById("dark_toggle").textContent = newDark === "1" ? "☀ light" : "🌙 dark";
+  document.getElementById("theme-css").textContent = newDark === "1" ? window.__DARK_CSS__ : window.__LIGHT_CSS__;
+  fetch("{{ url_for('toggle_dark_mode') }}", {method:"POST", headers:{"Content-Type":"application/x-www-form-urlencoded"}, body:"dark="+newDark}).catch(function(){});
+}
 </script>
 {{ body | safe }}
 </div>
+<script>
+var tc=document.getElementById('theme-css');
+if(tc)tc.textContent=tc.textContent.replace(//g,'{').replace(//g,'}');
+</script>
 </body>
 </html>
 """
 
 def render(title, active_tab, body_html, dark_mode=True, set_cookie=False):
-    css = DARK_CSS if dark_mode else LIGHT_CSS
+    css_raw = DARK_CSS if dark_mode else LIGHT_CSS
+    css_safe = css_raw.replace('{', '\x01').replace('}', '\x02')
     tab_links = [
         ('compose', 'Compose'),
         ('inbox', 'Inbox'),
@@ -438,7 +440,9 @@ def render(title, active_tab, body_html, dark_mode=True, set_cookie=False):
         tabs=tab_links,
         active_tab=active_tab,
         dark_mode=dark_mode,
-        css=css,
+        dark_css=DARK_CSS,
+        light_css=LIGHT_CSS,
+        page_css=css_safe,
         url_for=url_for,
     )
     resp = app.make_response(html)
