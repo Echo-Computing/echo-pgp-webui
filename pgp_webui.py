@@ -200,11 +200,11 @@ def encrypt_message(recipient, plaintext, armor=True, output=None):
     return result.stdout, result.stderr, result.returncode
 
 def list_public_keys():
-    out, err, code = run_gpg(['--list-keys'])
+    out, err, code = run_gpg(['--keyid-format=long', '--list-keys'])
     return out
 
 def list_secret_keys():
-    out, err, code = run_gpg(['--list-secret-keys'])
+    out, err, code = run_gpg(['--keyid-format=long', '--list-secret-keys'])
     return out
 
 def import_public_key(key_data: str) -> tuple[str, int]:
@@ -890,7 +890,9 @@ def keys_page():
         elif action == 'delete':
             key_id = request.form.get('key_id', '').strip()
             if key_id:
-                out, err, code = run_gpg(['--delete-keys', key_id])
+                # Delete secret key first if it exists (required by GPG before deleting pub key)
+                out, err, code = run_gpg(['--batch', '--yes', '--delete-secret-keys', key_id])
+                out, err, code = run_gpg(['--batch', '--yes', '--delete-keys', key_id])
                 if code == 0:
                     msg = '<div class="alert success">Key deleted.</div>'
                     keys_raw = list_public_keys()
@@ -898,21 +900,30 @@ def keys_page():
                     msg = f'<div class="alert error">Delete failed: {err}</div>'
 
     # Parse keys into structured display
+    # Output with --keyid-format=long looks like:
+    #   pub   rsa4096/0FA4F517F1464254 2026-03-27 [SCEAR]
+    #       DC0CD526AF3562D1C1C554706A14CEC641BE97C8  (40 hex chars, leading spaces stripped)
+    #   uid                 [ultimate] User <user@email>
     keys = []
     current_key = {}
-    for line in keys_raw.splitlines():
-        if line.startswith('pub'):
+    for i, line in enumerate(keys_raw.splitlines()):
+        stripped = line.lstrip()
+        if stripped.startswith('pub'):
             if current_key:
                 keys.append(current_key)
-            parts = line.split()
-            # Key ID is the part containing '/' (e.g. rsa4096/6A14CEC641BE97C8)
-            keyid = next((p for p in parts if '/' in p), parts[-1] if parts else '')
-            current_key = {'line': line, 'keyid': keyid, 'uids': []}
-        elif line.startswith('uid'):
-            m = re.search(r'<([^>]+)>', line)
-            current_key['uids'].append(m.group(1) if m else line.strip())
-        elif line.startswith('fpr'):
-            current_key['fingerprint'] = line.split()[-1]
+            parts = stripped.split()
+            keyid = next((p for p in parts if '/' in p), '')
+            current_key = {'keyid': keyid, 'fingerprint': '', 'uids': []}
+            # Next line may be the fingerprint (40 hex chars with possible spaces)
+            if i + 1 < len(keys_raw.splitlines()):
+                next_line = keys_raw.splitlines()[i + 1]
+                next_stripped = next_line.lstrip()
+                hex_clean = next_stripped.replace(' ', '')
+                if len(hex_clean) >= 32 and all(c in '0123456789ABCDEFabcdef' for c in hex_clean[:32]):
+                    current_key['fingerprint'] = hex_clean
+        elif stripped.startswith('uid') and current_key:
+            m = re.search(r'<([^>]+)>', stripped)
+            current_key['uids'].append(m.group(1) if m else stripped.strip())
     if current_key:
         keys.append(current_key)
 
@@ -931,16 +942,18 @@ def keys_page():
     for k in keys:
         fprint = k.get('fingerprint', '')
         uid_str = '<br>'.join(k['uids'])
-        keyid = k.get('keyid', '')
+        # Use fingerprint (full or last 16 chars) as the deletable key identifier
+        short_id = fprint[-16:] if fprint else k.get('keyid', '')
+        delete_key = fprint if fprint else short_id
         body += f'''
       <tr style="border-bottom:1px solid #21262d">
-        <td style="padding:0.5rem;font-family:monospace">{keyid}</td>
+        <td style="padding:0.5rem;font-family:monospace">{short_id}</td>
         <td style="padding:0.5rem;font-family:monospace;font-size:0.75rem">{fprint}</td>
         <td style="padding:0.5rem">{uid_str}</td>
         <td style="padding:0.5rem">
           <form method="post" style="display:inline">
             <input type="hidden" name="action" value="delete">
-            <input type="hidden" name="key_id" value="{keyid}">
+            <input type="hidden" name="key_id" value="{delete_key}">
             <button type="submit" class="btn small danger" onclick="return confirm('Delete this public key?')">Delete</button>
           </form>
         </td>
