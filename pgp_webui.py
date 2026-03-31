@@ -641,13 +641,32 @@ def inbox():
     .decrypted-content {{ background:#0d1117; border:1px solid #30363d; border-radius:6px; padding:1rem; margin-top:0.5rem; white-space:pre-wrap; word-break:break-all; max-height:400px; overflow-y:auto; font-size:0.85rem; }}
     table {{ width:100%; border-collapse:collapse; }}
     .decrypted-row td {{ padding:0.5rem 1rem 1rem; background:#161b22; }}
+    .search-row {{ margin-bottom:0.75rem; }}
+    .search-row input {{ padding:0.4rem 0.6rem; border-radius:4px; border:1px solid #30363d; background:#0d1117; color:#e6edf3; width:100%; box-sizing:border-box; font-size:0.9rem; }}
+    .search-row input::placeholder {{ color:#8b949e; }}
+    .search-row input:focus {{ outline:1px solid #58a6ff; border-color:#58a6ff; }}
     </style>
     {f'<div class="alert info">{len(messages)} messages — lazy decrypt: click to reveal</div>' if messages else f'<div class="alert info">No messages found</div>'}
     <div class="card"><h2>Inbox</h2>
+    <div class="search-row"><input type="text" id="searchInput" oninput="filterInbox()" placeholder="Search by subject, sender, or file name…"></div>
     <table><thead><tr><th>File</th><th>From</th><th>Subject</th><th>Time</th><th>Actions</th></tr></thead>
     <tbody>{html_rows}</tbody></table>
     </div>
     <script>
+    function filterInbox() {{
+      let term = document.getElementById('searchInput').value.toLowerCase();
+      let rows = document.querySelectorAll('tbody tr:not(.decrypted-row)');
+      rows.forEach(row => {{
+        let text = row.innerText.toLowerCase();
+        let visible = text.includes(term);
+        row.style.display = visible ? '' : 'none';
+        // Sync decrypted-row with parent
+        let dec = row.nextElementSibling;
+        if (dec && dec.classList.contains('decrypted-row')) {{
+          dec.style.display = visible ? '' : 'none';
+        }}
+      }});
+    }}
     async function decryptFile(filename, btn) {{
       let row = document.getElementById('row-' + filename);
       let content = document.getElementById('content-' + filename);
