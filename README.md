@@ -321,7 +321,6 @@ PGP_DIR/                        # set via PGP_DIR env var
 echo-pgp-webui/
 ├── pgp_webui.py                # the Flask application
 ├── db.py                       # SQLite storage backend
-├── rebuild_sent_log.py         # utility to rescan .asc files and rebuild sent_log.json
 ├── README.md                   # this file
 └── .gitignore
 ```
