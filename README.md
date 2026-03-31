@@ -310,19 +310,19 @@ After 5 failed decrypt attempts (wrong key/passphrase), the UI locks for 5 minut
 ## File Layout
 
 ```
-PGP_DIR/                        # set via PGP_DIR env var
-├── messages.db                # SQLite — message metadata + encrypted payloads
-├── reply0.asc                 # encrypted output files
-├── reply1.asc
-├── sent_log.json              # legacy log (updated on new sends for compat)
-├── .tmp_dec_*.asc             # temp files (cleaned up after decrypt)
-└── .tmp_import_*.asc          # temp files (cleaned up after key import)
-
 echo-pgp-webui/
-├── pgp_webui.py                # the Flask application
-├── db.py                       # SQLite storage backend
-├── README.md                   # this file
+├── pgp_webui.py       # Flask application — all routes, DB logic, and Jinja templates inline
+├── README.md
+├── LICENSE
 └── .gitignore
+
+PGP_DIR/               # set via PGP_DIR env var (default: script's parent directory)
+├── messages.db        # SQLite — message metadata + encrypted payloads
+├── reply0.asc         # encrypted output files (reply{N}.asc, sequential)
+├── reply1.asc
+├── sent_log.json      # legacy log (updated on new sends for backwards compat)
+├── inbox/             # received .asc files (auto-scanned on first load)
+└── .tmp_*.asc         # temp files (cleaned up after decrypt/import)
 ```
 
 ### SQLite Database Schema
@@ -436,7 +436,7 @@ curl "http://localhost:8765/api/messages/106"
 
 #### `DELETE /api/messages/<id>`
 
-Delete a message from the DB. Does NOT delete the `.asc` file.
+Delete a message from both SQLite DB AND the `.asc` file on disk.
 
 ```bash
 curl -X DELETE "http://localhost:8765/api/messages/106"
@@ -466,6 +466,7 @@ Content-Type: application/x-www-form-urlencoded
 action=encrypt
 message=Hello world
 recipient=friend@email.com
+subject=Greeting          # optional
 ```
 
 **Decrypt:**
@@ -497,6 +498,29 @@ POST /keys
 action=delete
 key_id=ABC123DEF456
 ```
+
+---
+
+### Web UI Routes
+
+| Route | Methods | Description |
+|-------|---------|-------------|
+| `/compose` | GET, POST | Encrypt or decrypt messages |
+| `/inbox` | GET | View all messages (lazy decrypt — click to reveal) |
+| `/inbox/decrypt_file/<filename>` | GET | Decrypt a file inline (lazy decrypt) |
+| `/inbox/raw/<filename>` | GET | Serve raw `.asc` file content |
+| `/inbox/delete_file/<filename>` | DELETE | Delete a disk-scanned `.asc` file (not tracked in DB) |
+| `/sent` | GET | View sent log |
+| `/sent/clear` | GET | Clear sent_log.json |
+| `/keys` | GET, POST | Key management — list, import, delete public keys |
+| `/keys/delete/<filename>` | DELETE | Delete a public key file from disk |
+| `/settings` | GET, POST | Settings — GPG homedir, confirmation guard, dark mode |
+| `/settings/kill-agent` | GET | Kill gpg-agent, clear passphrase cache |
+| `/toggle-dark` | POST | Toggle dark mode (cookie-based) |
+| `/api/messages` | GET, POST | REST API — list or create messages |
+| `/api/messages/<id>` | GET, DELETE | REST API — decrypt or delete single message |
+| `/api/wipe` | POST | Kill GPG agent, wipe DB, delete all `.asc` files |
+| `/health` | GET | Health check endpoint |
 
 ---
 
