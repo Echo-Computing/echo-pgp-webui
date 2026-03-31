@@ -605,7 +605,8 @@ def inbox():
     for m in messages[:30]:
         has_id = m['id'] is not None
         trash = '🗑'
-        delete_btn = f'<button class="btn danger" onclick="deleteMsg({m["id"]}, this)">{trash} Delete</button>' if has_id else ''
+        delete_btn = f'<button class="btn danger" onclick="deleteMsg({m["id"]}, this)">{trash} Delete</button>' if has_id else \
+                     f'<button class="btn danger" onclick="deleteFile(\'{m["file"]}\', this)">{trash} Delete</button>'
         html_rows += f'''<tr>
           <td><code>{m['file']}</code></td>
           <td>{m.get('sender','')}</td>
@@ -667,6 +668,18 @@ def inbox():
         btn.closest('tr').remove();
       }} catch(e) {{ alert('Delete failed: '+e.message); }}
     }}
+    async function deleteFile(filename, btn) {{
+      if (!confirm('Delete ' + filename + ' from disk?')) return;
+      try {{
+        let resp = await fetch('/inbox/delete_file/' + encodeURIComponent(filename), {{method:'DELETE'}});
+        if (resp.status === 404) {{
+          btn.closest('tr').remove();
+          return;
+        }}
+        if (!resp.ok) throw new Error(await resp.text());
+        btn.closest('tr').remove();
+      }} catch(e) {{ alert('Delete failed: '+e.message); }}
+    }}
     </script>'''
     return render('Inbox', 'inbox', body, dark)
 
@@ -692,6 +705,17 @@ def inbox_raw(filename):
     if not file_path.exists() or not file_path.is_file():
         return 'File not found', 404
     return file_path.read_text(errors='replace'), 200, {'Content-Type': 'text/plain'}
+
+@app.route('/inbox/delete_file/<filename>', methods=['DELETE'])
+def inbox_delete_file(filename):
+    """Delete a file from disk (for disk-scanned .asc files not tracked in DB)."""
+    pgp_dir = app.config['PGP_DIR']
+    safe_name = Path(filename).name
+    file_path = pgp_dir / safe_name
+    if file_path.exists() and file_path.is_file():
+        file_path.unlink(missing_ok=True)
+        return jsonify({'deleted': str(file_path)})
+    return jsonify({'error': 'File not found'}), 404
 
 @app.route('/sent')
 def sent():
