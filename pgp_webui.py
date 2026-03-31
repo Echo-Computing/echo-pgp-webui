@@ -212,8 +212,8 @@ def list_secret_keys():
     out, err, code = run_gpg(['--keyid-format=long', '--list-secret-keys'])
     return out
 
-def import_public_key(key_data: str) -> tuple[str, int]:
-    """Import a public key block. Returns (output, returncode)."""
+def import_public_key(key_data: str) -> tuple[str, str, int]:
+    """Import a public key block. Returns (stdout, stderr, returncode)."""
     tmp = app.config['PGP_DIR'] / f'.tmp_import_{int(time.time())}.asc'
     tmp.write_text(key_data.strip())
     out, err, code = run_gpg(['--import', str(tmp)])
@@ -221,7 +221,7 @@ def import_public_key(key_data: str) -> tuple[str, int]:
         tmp.unlink()
     except Exception:
         pass
-    return out, code
+    return out, err, code
 
 def gpg_agent_status():
     out, err, code = run_gpg(['--list-keys'])
@@ -1037,12 +1037,15 @@ def keys_page():
         if action == 'import':
             key_data = request.form.get('key_data', '').strip()
             if key_data:
-                out, code = import_public_key(key_data)
+                out, err, code = import_public_key(key_data)
                 if code == 0:
-                    msg = '<div class="alert success">Key imported successfully!</div>'
+                    if 'not changed' in out or 'not changed' in err:
+                        msg = '<div class="alert info">Key already imported (no changes).</div>'
+                    else:
+                        msg = '<div class="alert success">Key imported successfully!</div>'
                     keys_raw = list_public_keys()  # refresh
                 else:
-                    msg = f'<div class="alert error">Import failed: {out}</div>'
+                    msg = f'<div class="alert error">Import failed: {err or out}</div>'
         elif action == 'delete':
             key_id = request.form.get('key_id', '').strip()
             if key_id:
