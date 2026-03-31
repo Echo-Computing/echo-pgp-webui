@@ -622,7 +622,8 @@ def inbox():
         trash = '🗑'
         delete_btn = f'<button class="btn danger" onclick="deleteMsg({m["id"]}, this)">{trash} Delete</button>' if has_id else \
                      f'<button class="btn danger" onclick="deleteFile(\'{m["file"]}\', this)">{trash} Delete</button>'
-        html_rows += f'''<tr>
+        html_rows += f'''<tr data-id="{m['id']}">
+          <td style="text-align:center"><input type="checkbox" class="row-check" value="{m["id"]}" onclick="updateBulkBtn()"></td>
           <td><code>{m['file']}</code></td>
           <td>{m.get('sender','')}</td>
           <td>{m.get('subject','')[:40]}</td>
@@ -635,7 +636,7 @@ def inbox():
           </td>
         </tr>
         <tr class="decrypted-row" id="row-{m['file']}" style="display:none">
-          <td colspan="5"><div class="decrypted-content" id="content-{m['file']}"></div></td>
+          <td colspan="6"><div class="decrypted-content" id="content-{m['file']}"></div></td>
         </tr>'''
 
     body = f'''
@@ -651,10 +652,47 @@ def inbox():
     {f'<div class="alert info">{len(messages)} messages — lazy decrypt: click to reveal</div>' if messages else f'<div class="alert info">No messages found</div>'}
     <div class="card"><h2>Inbox</h2>
     <div class="search-row"><input type="text" id="searchInput" oninput="filterInbox()" placeholder="Search by subject, sender, or file name…"></div>
-    <table><thead><tr><th>File</th><th>From</th><th>Subject</th><th>Time</th><th>Actions</th></tr></thead>
+    <div style="margin-bottom:0.5rem"><button class="btn danger" id="bulkDeleteBtn" onclick="deleteSelected()" style="display:none">🗑 Delete Selected (<span id="selCount">0</span>)</button></div>
+    <table><thead><tr><th style="width:2rem"><input type="checkbox" id="selectAll" onclick="toggleAll(this)"></th><th>File</th><th>From</th><th>Subject</th><th>Time</th><th>Actions</th></tr></thead>
     <tbody>{html_rows}</tbody></table>
     </div>
     <script>
+    function toggleAll(src) {{
+      document.querySelectorAll('.row-check').forEach(cb => cb.checked = src.checked);
+      updateBulkBtn();
+    }}
+    function updateBulkBtn() {{
+      let checked = document.querySelectorAll('.row-check:checked');
+      let btn = document.getElementById('bulkDeleteBtn');
+      let count = document.getElementById('selCount');
+      count.textContent = checked.length;
+      btn.style.display = checked.length > 0 ? '' : 'none';
+    }}
+    async function deleteSelected() {{
+      let checked = document.querySelectorAll('.row-check:checked');
+      if (!checked.length) return;
+      if (!confirm('Delete ' + checked.length + ' message(s) from DB and disk?')) return;
+      let ids = Array.from(checked).map(cb => cb.value);
+      let errors = [];
+      for (let id of ids) {{
+        try {{
+          let resp = await fetch('/api/messages/' + id, {{method:'DELETE'}});
+          if (!resp.ok && resp.status !== 404) errors.push(id);
+          else {{
+            // Remove both the row and its decrypted-row sibling
+            let tr = document.querySelector('tr[data-id="' + id + '"]');
+            if (tr) {{ let next = tr.nextElementSibling; if (next && next.classList.contains('decrypted-row')) next.remove(); tr.remove(); }}
+            else {{
+              // Fallback: remove by checking checkbox's parent row
+              let row = document.querySelector('input.row-check[value="' + id + '"]').closest('tr');
+              if (row) {{ let next = row.nextElementSibling; if (next && next.classList.contains('decrypted-row')) next.remove(); row.remove(); }}
+            }}
+          }}
+        }} catch(e) {{ errors.push(id); }}
+      }}
+      if (errors.length) alert('Failed to delete: ' + errors.join(', '));
+      updateBulkBtn();
+    }}
     function filterInbox() {{
       let term = document.getElementById('searchInput').value.toLowerCase();
       let rows = document.querySelectorAll('tbody tr:not(.decrypted-row)');
