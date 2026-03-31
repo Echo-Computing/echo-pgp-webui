@@ -20,13 +20,15 @@ import hashlib
 from pathlib import Path
 from datetime import datetime
 
-# ── Identity ─────────────────────────────────────────────────────────────────
-# REPLACE THESE with your actual identity before running
-SENDER_IDENTITY = 'echo@vault.local'
-PGP_DIR = Path('D:/pgp')
-
-# ── Database ─────────────────────────────────────────────────────────────────
+# ── Paths (all configurable via env vars) ────────────────────────────────────
+# PGP_DIR: directory for keys, reply*.asc files, sent_log.json
+# DB_PATH: path to SQLite messages.db (defaults to PGP_DIR/messages.db)
+_PGP_DIR_ENV = os.environ.get('PGP_DIR', str(Path(__file__).parent.resolve()))
+PGP_DIR = Path(_PGP_DIR_ENV)
 DB_PATH = Path(os.environ.get('PGP_DB_PATH', str(PGP_DIR / 'messages.db')))
+
+# Sender identity — replace with your GPG key email before running
+SENDER_IDENTITY = os.environ.get('PGP_SENDER_ID', 'echo@vault.local')
 
 sys.path.insert(0, str(PGP_DIR))
 
