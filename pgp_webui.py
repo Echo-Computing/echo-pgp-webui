@@ -26,7 +26,15 @@ from datetime import datetime
 # ── Paths (all configurable via env vars) ────────────────────────────────────
 # PGP_DIR: directory for keys, reply*.asc files, sent_log.json
 # DB_PATH: path to SQLite messages.db (defaults to PGP_DIR/messages.db)
-_PGP_DIR_ENV = os.environ.get('PGP_DIR', str(Path(__file__).parent.resolve()))
+_MEIPASS = getattr(sys, '_MEIPASS', None)
+if _MEIPASS:
+    # Running as PyInstaller EXE — use user-writable LOCALAPPDATA
+    import os
+    _default_pgp_dir = os.path.expandvars('%LOCALAPPDATA%\\pgp_vault')
+else:
+    _default_pgp_dir = str(Path(__file__).parent.resolve())
+
+_PGP_DIR_ENV = os.environ.get('PGP_DIR', _default_pgp_dir)
 PGP_DIR = Path(_PGP_DIR_ENV)
 DB_PATH = Path(os.environ.get('PGP_DB_PATH', str(PGP_DIR / 'messages.db')))
 
