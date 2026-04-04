@@ -1103,11 +1103,14 @@ def keys_page():
                 current_key['expires'] = m.group(1)
         elif stripped.startswith('uid') and current_key:
             # Extract full UID string (not just email), preserving full format like "Name <email@domain>"
-            m = re.search(r'^(.*?)<([^>]+)>', stripped)
+            # Format: "uid  [ unknown] User Name"  or  "uid  [ unknown] User Name <user@domain>"
+            # Strip the leading "uid" and bracket label, then extract name + optional email
+            stripped_uid = re.sub(r'^uid\s+(?:\[[^\]]*\])?\s*', '', stripped)
+            m = re.search(r'^(.*?)<([^>]+)>', stripped_uid)
             if m:
-                current_key['uids'].append(f'{m.group(1)} <{m.group(2)}>')
+                current_key['uids'].append(f'{m.group(1).strip()} <{m.group(2)}>')
             else:
-                current_key['uids'].append(stripped.strip())
+                current_key['uids'].append(stripped_uid.strip())
     if current_key:
         keys.append(current_key)
 
@@ -1146,6 +1149,8 @@ def keys_page():
                 expiry_badge = f'<span style="background:#1c2128;color:{badge_color};border:1px solid {badge_color};border-radius:4px;padding:1px 6px;font-size:0.75rem">{badge_text}</span>'
             except Exception:
                 expiry_badge = f'<span style="color:#8b949e">{k["expires"]}</span>'
+        else:
+            expiry_badge = f'<span style="color:#8b949e">never expires</span>'
         body += f'''
       <tr style="border-bottom:1px solid #21262d">
         <td style="padding:0.5rem;font-family:monospace">{short_id}</td>
