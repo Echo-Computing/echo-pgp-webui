@@ -17,6 +17,9 @@ import threading
 import re
 import sqlite3
 import hashlib
+import secrets
+import ssl
+import socket
 from pathlib import Path
 from datetime import datetime
 
@@ -29,6 +32,26 @@ DB_PATH = Path(os.environ.get('PGP_DB_PATH', str(PGP_DIR / 'messages.db')))
 
 # Sender identity — replace with your GPG key email before running
 SENDER_IDENTITY = os.environ.get('PGP_SENDER_ID', 'echo@vault.local')
+
+# ─── Auth token for mobile API clients ─────────────────────────────────────────
+_AUTH_TOKEN_FILE = PGP_DIR / '.auth_token'
+
+def _load_auth_token():
+    if _AUTH_TOKEN_FILE.exists():
+        return _AUTH_TOKEN_FILE.read_text().strip()
+    token = secrets.token_hex(32)
+    try:
+        _AUTH_TOKEN_FILE.write_text(token)
+    except Exception:
+        pass
+    return token
+
+AUTH_TOKEN = os.environ.get('PGP_AUTH_TOKEN', _load_auth_token())
+
+# ─── TLS certificates ───────────────────────────────────────────────────────────
+CERT_PATH = PGP_DIR / 'pgpvault.crt'
+KEY_PATH = PGP_DIR / 'pgpvault.key'
+CA_CERT_PATH = PGP_DIR / 'pgpvault-ca.crt'
 
 sys.path.insert(0, str(PGP_DIR))
 
@@ -50,8 +73,9 @@ GPG_BIN = _resolve_gpg()
 
 try:
     from flask import Flask, request, render_template_string, jsonify, redirect, url_for
+    from flask_cors import CORS
 except ImportError:
-    print("[ERROR] Flask is required: pip install flask")
+    print("[ERROR] Flask and flask-cors are required: pip install flask flask-cors")
     sys.exit(1)
 
 logging.basicConfig(
@@ -65,7 +89,19 @@ app.config['PGP_DIR'] = PGP_DIR
 app.config['SENDER_IDENTITY'] = SENDER_IDENTITY
 app.config['DB_PATH'] = DB_PATH
 
-# TEMP DEBUG ROUTE — remove after diagnosis
+# Enable CORS for mobile API clients
+CORS(app, resources={r"/api/*": {"origins": "*"}})
+
+# ─── API auth guard ────────────────────────────────────────────────────────────
+@app.before_request
+def _check_api_auth():
+    if request.path.startswith('/api/') and request.method != 'OPTIONS':
+        auth = request.headers.get('Authorization', '')
+        if not auth.startswith('Bearer '):
+            return jsonify({'error': 'Missing or invalid Authorization header'}), 401
+        token = auth[7:]
+        if token != AUTH_TOKEN:
+            return jsonify({'error': 'Invalid token'}), 403
 # ─── SQLite Storage ──────────────────────────────────────────────────────────
 
 def get_db() -> sqlite3.Connection:
@@ -988,7 +1024,30 @@ def settings_page():
       <tr><td>PGP_DB_PATH</td><td><code>{app.config['DB_PATH']}</code></td></tr>
       <tr><td>PGP_CLIPBOARD_CLEAR_SECONDS</td><td><code>{os.environ.get('PGP_CLIPBOARD_CLEAR_SECONDS','30')}</code></td></tr>
       <tr><td>PGP_MAX_ATTEMPTS</td><td><code>{os.environ.get('PGP_MAX_ATTEMPTS','5')}</code></td></tr>
+      <tr><td>PGP_AUTH_TOKEN</td><td><code style="font-size:0.7rem">{AUTH_TOKEN}</code> <button class="btn small" onclick="regenToken()">🔄 Regenerate</button></td></tr>
     </table>
+    </div>
+    <div class="card">
+    <h2>Mobile API</h2>
+    <p style="color:#8b949e;font-size:0.85rem;margin-bottom:1rem">
+      Connect the mobile app to this server. The auth token is required in the <code>Authorization: Bearer &lt;token&gt;</code> header for all <code>/api/*</code> requests.
+    </p>
+    <table>
+      <tr><td>Server LAN address</td><td><code>https://{_get_lan_ip()}:8765</code></td></tr>
+      <tr><td>CA certificate</td><td><a href="/settings/ca-cert" class="btn small primary">⬇ Download CA cert</a> — install on Android for TLS</td></tr>
+    </table>
+    <script>
+    async function regenToken() {{
+      if (!confirm('Regenerate the API auth token? The mobile app will need the new token.')) return;
+      let r = await fetch('/settings/regen-token', {{
+        method: 'POST',
+        headers: {{'Content-Type': 'application/json'}}
+      }});
+      let d = await r.json();
+      document.querySelector('code[style*="font-size:0.7rem"]').textContent = d.token;
+      alert('Token regenerated. Update your mobile app!');
+    }}
+    </script>
     </div>
     <div class="card">
     <h2>Danger Zone</h2>
@@ -1016,6 +1075,40 @@ def settings_page():
     </script>
     </div>'''
     return render('Settings', 'settings', body, dark)
+
+@app.route('/settings/ca-cert')
+def serve_ca_cert():
+    """Download the CA certificate for Android TLS setup."""
+    if not CA_CERT_PATH.exists():
+        return 'CA certificate not found — run the server with HTTPS first', 404
+    from flask import make_response
+    resp = make_response(CA_CERT_PATH.read_text())
+    resp.headers['Content-Type'] = 'application/x-x509-ca-cert'
+    resp.headers['Content-Disposition'] = 'attachment; filename=pgpvault-ca.crt'
+    return resp
+
+@app.route('/settings/regen-token', methods=['POST'])
+def regen_token():
+    """Regenerate the API auth token."""
+    global AUTH_TOKEN
+    token = secrets.token_hex(32)
+    try:
+        _AUTH_TOKEN_FILE.write_text(token)
+    except Exception:
+        pass
+    AUTH_TOKEN = token
+    return jsonify({'token': token})
+
+def _get_lan_ip():
+    """Get the LAN IP address of this machine."""
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(('8.8.8.8', 80))
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+    except Exception:
+        return '127.0.0.1'
 
 @app.route('/settings/kill-agent')
 def kill_agent():
@@ -1293,7 +1386,7 @@ def api_messages():
         'content_hash': h,
     }), 201
 
-@app.route('/api/messages/<int:msg_id>', methods=['GET', 'DELETE'])
+@app.route('/api/messages/<int:msg_id>', methods=['GET', 'DELETE', 'PATCH'])
 def api_message(msg_id):
     """GET a single message by ID. DELETE to remove."""
     conn = get_db()
@@ -1416,6 +1509,63 @@ def _append_sent_log(recipient, file_path):
 
 # ─── Main ──────────────────────────────────────────────────────────────────────
 
+def _ensure_tls_cert():
+    """Generate self-signed CA + server cert on first run."""
+    if CERT_PATH.exists() and KEY_PATH.exists() and CA_CERT_PATH.exists():
+        return
+    PGP_DIR.mkdir(parents=True, exist_ok=True)
+    try:
+        import subprocess
+        ca_key = PGP_DIR / 'pgpvault-ca.key'
+        subprocess.run([
+            'openssl', 'req', '-new', '-x509', '-days', '3650',
+            '-subj', '/CN=PGPVaultCA/O=EchoVault',
+            '-keyout', str(ca_key), '-out', str(CA_CERT_PATH),
+            '-passout', 'pass:pgpvaultca', '-nodes',
+        ], check=True, capture_output=True)
+        subprocess.run([
+            'openssl', 'genrsa', '-out', str(KEY_PATH), '2048',
+        ], check=True, capture_output=True)
+        hostname = socket.gethostname()
+        subprocess.run([
+            'openssl', 'req', '-new', '-days', '365',
+            '-subj', f'/CN={hostname}/O=PGPVault',
+            '-key', str(KEY_PATH), '-out', str(CERT_PATH),
+            '-CA', str(CA_CERT_PATH), '-CAkey', str(ca_key),
+            '-passin', 'pass:pgpvaultca', '-nodes',
+        ], check=True, capture_output=True)
+        print(f"[*] Generated TLS certificates in {PGP_DIR}")
+        print(f"[*] Download CA cert: http://localhost:{port}/settings/ca-cert")
+    except Exception as e:
+        print(f"[!] TLS cert generation failed (openssl not found?): {e}")
+        print(f"[!] Server will run over HTTP only.")
+
+
+def _register_mdns(use_https=True):
+    """Register _pgpvault._tcp.local. via mDNS on the LAN."""
+    try:
+        import zeroconf
+    except ImportError:
+        return  # python-zeroconf not installed — skip silently
+
+    try:
+        from zeroconf import ServiceInfo
+        zc = zeroconf.Zeroconf()
+        lan_ip = _get_lan_ip()
+        scheme = 'https' if use_https else 'http'
+        svc = ServiceInfo(
+            '_pgpvault._tcp.local.',
+            f'PGPVault._pgpvault._tcp.local.',
+            addresses=[socket.inet_aton(lan_ip)],
+            port=port,
+            properties={'scheme': scheme, 'version': '1.0'},
+        )
+        zc.register_service(svc)
+        print(f"[*] mDNS registered: PGPVault._pgpvault._tcp.local. ({scheme}://{lan_ip}:{port})")
+    except Exception as e:
+        print(f"[!] mDNS registration failed: {e}")
+
+
 if __name__ == '__main__':
     # Initialize DB and import existing sent_log on first run
     conn = get_db()
@@ -1423,6 +1573,14 @@ if __name__ == '__main__':
 
     port = int(os.environ.get('PGP_WEBUI_PORT', '8765'))
     sender = app.config['SENDER_IDENTITY']
+
+    # Generate TLS certs on first run
+    _ensure_tls_cert()
+    use_https = CERT_PATH.exists() and KEY_PATH.exists()
+
+    # Register mDNS for LAN discovery
+    _register_mdns(use_https=use_https)
+
     print(r"""
    __   __      _____   _   _  ______  _____
    \ \ / /     |_   _| | \ | ||  ____|/ ____|
@@ -1434,11 +1592,21 @@ if __name__ == '__main__':
    echo-pgp-webui  |  Echo Vault <echo@vault.local>
    https://github.com/Echo-Computing/echo-pgp-webui
 """)
-    print(f"[*] PGP Vault Web UI starting on http://localhost:{port}")
+    scheme = 'https' if use_https else 'http'
+    print(f"[*] PGP Vault Web UI starting on {scheme}://localhost:{port}")
     print(f"[*] PGP_DIR: {app.config['PGP_DIR']}")
     print(f"[*] DB_PATH: {app.config['DB_PATH']}")
     print(f"[*] SENDER_IDENTITY: {sender}")
+    print(f"[*] AUTH_TOKEN: {AUTH_TOKEN[:8]}...")
     if imported:
         print(f"[*] Imported {imported} entries from sent_log.json")
+    if not use_https:
+        print(f"[!] Running over HTTP — mobile clients should connect via VPN")
     print(f"[*] Press Ctrl+C to stop")
-    app.run(host='0.0.0.0', port=port, debug=False)
+
+    if use_https:
+        ssl_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ssl_ctx.load_cert_chain(str(CERT_PATH), str(KEY_PATH))
+        app.run(host='0.0.0.0', port=port, debug=False, ssl_context=ssl_ctx)
+    else:
+        app.run(host='0.0.0.0', port=port, debug=False)
