@@ -1,0 +1,5 @@
+# PGP Vault Server dependencies
+# pip install -r requirements-server.txt
+flask
+flask-cors
+zeroconf

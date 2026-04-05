@@ -15,16 +15,15 @@ A standalone, self-hosted Flask web interface for GPG encrypt/decrypt operations
 ```bash
 git clone https://github.com/Echo-Computing/echo-pgp-webui
 cd echo-pgp-webui
-pip install flask requests gnupg
+pip install -r requirements-server.txt
 
 # Configure your identity
 export PGP_SENDER_ID="you@yourdomain.com"
-export PGP_DIR="$HOME/.gnupg"        # your GPG home directory
-export PGP_DB_PATH="$HOME/.gnupg/messages.db"  # SQLite database (default: PGP_DIR/messages.db)
+export PGP_DIR="$HOME/.gnupg"
 export PGP_WEBUI_PORT=8765
 
 python3 pgp_webui.py
-# Opens http://localhost:8765
+# Opens https://localhost:8765
 ```
 
 ---
@@ -311,10 +310,25 @@ After 5 failed decrypt attempts (wrong key/passphrase), the UI locks for 5 minut
 
 ```
 echo-pgp-webui/
-├── pgp_webui.py       # Flask application — all routes, DB logic, and Jinja templates inline
+├── pgp_webui.py          # Flask application — all routes, DB logic, and Jinja templates inline
+├── requirements-server.txt  # pip install -r requirements-server.txt
 ├── README.md
 ├── LICENSE
-└── .gitignore
+├── .gitignore
+│
+├── desktop/               # PyInstaller EXE build
+│   └── pgpvault.spec     # PyInstaller spec
+│
+├── pgp_mobile/           # Flet mobile/desktop client
+│   ├── main.py           # Flet app entry point
+│   └── lib/
+│       └── api_client.py  # httpx REST client for server API
+│
+├── tools/
+│   ├── build-exe.bat    # Build desktop EXE
+│   └── build-mobile.bat  # Build Flet mobile app
+│
+└── mobile_dist/          # Flet output (desktop EXE)
 
 PGP_DIR/               # set via PGP_DIR env var (default: script's parent directory)
 ├── messages.db        # SQLite — message metadata + encrypted payloads
@@ -356,7 +370,13 @@ CREATE INDEX idx_sender      ON messages(sender);
 
 ### REST API — `/api/*`
 
-All `/api/*` endpoints accept and return JSON. Use this for programmatic access.
+All `/api/*` endpoints require HTTPS and Bearer token authentication:
+
+```bash
+curl -H "Authorization: Bearer <token>" http://localhost:8765/api/messages
+```
+
+The token is shown on the Settings page and stored in `PGP_DIR/.auth_token`.
 
 #### `POST /api/messages`
 
@@ -550,6 +570,98 @@ gunicorn -w 2 -b 0.0.0.0:8765 pgp_webui:app
 ```
 
 Or behind a reverse proxy (nginx/Caddy) with HTTPS.
+
+---
+
+## Desktop EXE — PyInstaller
+
+A standalone Windows executable is available. No Python installation required.
+
+### Download
+
+Download `pgpvault.exe` from `desktop/dist/` in the repository, or build your own:
+
+```batch
+git clone https://github.com/Echo-Computing/echo-pgp-webui
+cd echo-pgp-webui
+tools\build-exe.bat
+```
+
+### First Run
+
+1. Double-click `pgpvault.exe`
+2. Server starts at `https://localhost:8765`
+3. GPG keys are auto-detected from your system PATH / Git / GnuPG install
+4. Data (DB, TLS certs, auth token) stored in `%LOCALAPPDATA%\pgp_vault`
+
+### GPG Detection
+
+The EXE looks for GPG in this order:
+1. Bundled `gpg/gpg.exe` (if you added one via `--add-data`)
+2. `gpg` or `gpg2` in your system PATH
+3. `C:\Program Files\Git\usr\bin\gpg.exe`
+4. `C:\Program Files (x86)\GnuPG\bin\gpg.exe`
+5. Prompts to install GnuPG from gpg4win.org
+
+### Build Desktop EXE Manually
+
+```batch
+pip install flask flask-cors zeroconf pyinstaller
+python -m PyInstaller desktop\pgpvault.spec
+# Output: desktop\dist\pgpvault.exe
+```
+
+---
+
+## Mobile App — Flet
+
+A Flet-based mobile/desktop client app connects to the Flask server over HTTPS.
+
+### Build Desktop Client EXE
+
+```batch
+pip install flet httpx
+cd pgp_mobile
+flet pack main.py --add-data "lib:lib" --product-name "PGP Vault" --company-name "EchoVault"
+# Output: mobile_dist\main.exe
+```
+
+### Build Android APK
+
+Requires **Flutter SDK** (install from [flutter.dev](https://flutter.dev)):
+
+```batch
+flutter doctor                        # check setup
+flutter config --enable-android      # enable Android toolchain
+flutter build apk --release          # outputs: build/app/outputs/flutter-apk/app-release.apk
+```
+
+### Connecting the Mobile App
+
+1. Start the desktop server (`pgpvault.exe` or `python pgp_webui.py`)
+2. On the desktop: open **Settings → Mobile API** — copy the `AUTH_TOKEN`
+3. In the mobile app: enter your desktop's LAN IP (e.g. `https://192.168.50.239:8765`) and the auth token
+4. For HTTPS: download the CA cert from **Settings → Mobile API → Download CA cert**, install it on your Android device as a trusted CA
+
+### Remote Access via VPN
+
+The mobile app connects over your LAN or a VPN tunnel:
+
+- **WireGuard/OpenVPN**: connect your phone to the same VPN as the desktop
+- The mobile app uses the VPN IP of the desktop (e.g. `10.0.0.2:8765`)
+- No port forwarding or cloud relay needed
+
+---
+
+## Security Considerations
+
+| Concern | Mitigation |
+|---------|-----------|
+| Mobile app sends auth token in cleartext over HTTPS | TLS encryption protects the token in transit |
+| Auth token stored on mobile device | Store in secure enclave / app-private storage |
+| CA cert installed on Android | Grants the app's traffic trust — only install from a server you control |
+| Secret keys on desktop only | Private keys never leave the desktop GPG keyring |
+| Message content in SQLite | Encrypted payload — ciphertext only, not plaintext |
 
 ---
 
