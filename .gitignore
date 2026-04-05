@@ -11,15 +11,15 @@ desktop/dist/
 desktop/build/
 *.spec
 
+# Flet mobile build output
+mobile_dist/
+pgp_mobile/build/
+
 # Runtime files (generated at runtime — never commit)
 .auth_token
 messages.db
 pgpvault.crt
 pgpvault-ca.crt
-
-# Virtual environments
-venv/
-.env
 
 # Virtual environments
 venv/

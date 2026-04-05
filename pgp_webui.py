@@ -20,6 +20,7 @@ import hashlib
 import secrets
 import ssl
 import socket
+import traceback
 from pathlib import Path
 from datetime import datetime
 
@@ -99,6 +100,12 @@ app.config['DB_PATH'] = DB_PATH
 
 # Enable CORS for mobile API clients
 CORS(app, resources={r"/api/*": {"origins": "*"}})
+
+# Global error handler — always log unhandled exceptions with full traceback
+@app.errorhandler(Exception)
+def handle_exception(e):
+    logger.exception("Unhandled exception: %s", e)
+    return f"<h1>Internal Server Error</h1><pre>{traceback.format_exc()}</pre>", 500
 
 # ─── API auth guard ────────────────────────────────────────────────────────────
 @app.before_request
@@ -702,7 +709,13 @@ def inbox():
 
     messages = []
     for r in rows:
-        fp = Path(r['file_path']) if r['file_path'] else None
+        fp = None
+        try:
+            fp = Path(r['file_path']) if r['file_path'] else None
+            size = fp.stat().st_size if fp and fp.exists() else 0
+        except (OSError, PermissionError, FileNotFoundError):
+            size = 0
+            fp = None
         messages.append({
             'id': r['id'],
             'file': Path(r['file_path']).name if r['file_path'] else '',
@@ -710,13 +723,18 @@ def inbox():
             'sender': r['sender'],
             'recipient': r['recipient'],
             'subject': r['subject'],
-            'size': fp.stat().st_size if fp and fp.exists() else 0,
+            'size': size,
             'read': r.get('read', 0),
         })
 
     # Fallback: scan disk for .asc files not yet in DB (backwards compat)
     logged_files = {Path(r['file_path']).name for r in rows if r['file_path']}
-    for f in sorted(pgp_dir.glob('*.asc'), key=lambda x: x.stat().st_mtime, reverse=True):
+    try:
+        disk_files = list(pgp_dir.glob('*.asc'))
+    except (OSError, PermissionError) as e:
+        logger.warning("Cannot glob PGP_DIR %s: %s", pgp_dir, e)
+        disk_files = []
+    for f in sorted(disk_files, key=lambda x: x.stat().st_mtime, reverse=True):
         if f.name in logged_files:
             continue
         if any(f.name.startswith(p) for p in ('out_', 'roundtrip', 'reply_')):
@@ -735,7 +753,7 @@ def inbox():
                     'subject': '',
                     'size': f.stat().st_size,
                 })
-        except:
+        except (OSError, PermissionError):
             pass
 
     messages.sort(key=lambda x: x.get('timestamp', ''), reverse=True)

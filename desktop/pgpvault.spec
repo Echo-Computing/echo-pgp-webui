@@ -1,21 +1,28 @@
 """
 PyInstaller spec for PGP Vault Desktop EXE
 Run: pyinstaller desktop/pgpvault.spec
-Output: desktop/dist/pgpvault/
+Output: desktop/dist/pgpvault.exe
+
+NOTE: Paths below are relative to the spec file location so any user
+downloading the repo can build from their own machine without editing.
+Replace TEMP_PGP_DIR, TEMP_PGP_DB, and TEMP_SENDER_ID with your actual
+values BEFORE building if you want them hardcoded — otherwise the EXE
+will auto-detect GPG and prompt for settings on first run.
 """
 
 import sys
 from pathlib import Path
 
+# Resolve paths relative to THIS spec file (desktop/pgpvault.spec)
+# so the build works from any clone location.
+SPEC_DIR = Path(__file__).parent.resolve()
+REPO_DIR = SPEC_DIR.parent
+
 block_cipher = None
-# Hardcoded project root — PyInstaller doesn't provide __file__ in spec scope
-SRC = Path(r'D:\pgp_publish\pgp_webui.py')
-DIST = Path(r'D:\pgp_publish\desktop\dist')
-WORK = Path(r'D:\pgp_publish\desktop\build')
 
 a = Analysis(
-    [str(SRC)],
-    pathex=[],
+    [str(REPO_DIR / 'pgp_webui.py')],
+    pathex=[str(REPO_DIR)],
     binaries=[],
     datas=[],
     hiddenimports=[
@@ -43,6 +50,6 @@ exe = EXE(
     icon=None,
     version=None,
     exclude_binaries=False,
-    distpath=DIST,
-    workpath=WORK,
+    distpath=SPEC_DIR / 'dist',
+    workpath=SPEC_DIR / 'build',
 )
