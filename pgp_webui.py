@@ -782,7 +782,7 @@ def inbox():
             'recipient': r['recipient'],
             'subject': r['subject'],
             'size': size,
-            'read': r.get('read', 0),
+            'read': r['read'] if 'read' in r.keys() else 0,
         })
 
     # Fallback: scan disk for .asc files not yet in DB (backwards compat)
