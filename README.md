@@ -17,14 +17,21 @@ git clone https://github.com/Echo-Computing/echo-pgp-webui
 cd echo-pgp-webui
 pip install -r requirements-server.txt
 
+# Generate HTTPS certificates (run once before first launch)
+python tools/generate-cert.py
+
 # Configure your identity
 export PGP_SENDER_ID="you@yourdomain.com"
 export PGP_DIR="$HOME/.gnupg"
-export PGP_WEBUI_PORT=8765
 
 python3 pgp_webui.py
 # Opens https://localhost:8765
 ```
+
+> **HTTPS note:** The server uses a self-signed certificate. Your browser will show
+> "Not private" or "Unsafe" on first visit — this is normal. Click **Advanced →
+> Proceed to localhost (unsafe)**. The CA cert at `pgpvault-ca.crt` is what
+> mobile clients need to install as trusted.
 
 ---
 
@@ -34,7 +41,7 @@ python3 pgp_webui.py
 
 - **Python 3.8+** — [python.org](https://python.org) or Windows Store
 - **GnuPG** — see OS-specific instructions below
-- **Flask + requests** — `pip install flask requests`
+- **Flask + flask-cors + zeroconf** — `pip install -r requirements-server.txt`
 
 Verify GPG is installed:
 
@@ -575,24 +582,29 @@ Or behind a reverse proxy (nginx/Caddy) with HTTPS.
 
 ## Desktop EXE — PyInstaller
 
-A standalone Windows executable is available. No Python installation required.
+A standalone Windows executable. No Python installation required.
 
-### Download
-
-Download `pgpvault.exe` from `desktop/dist/` in the repository, or build your own:
+### Build It
 
 ```batch
 git clone https://github.com/Echo-Computing/echo-pgp-webui
 cd echo-pgp-webui
 tools\build-exe.bat
 ```
+Output: `desktop\dist\pgpvault\pgpvault.exe`
+
+The spec uses relative paths — any user can build from their own clone
+without editing the source. The CA cert (`pgpvault-ca.crt`) is bundled
+into the output directory so the server can serve it to mobile clients.
 
 ### First Run
 
 1. Double-click `pgpvault.exe`
 2. Server starts at `https://localhost:8765`
-3. GPG keys are auto-detected from your system PATH / Git / GnuPG install
-4. Data (DB, TLS certs, auth token) stored in `%LOCALAPPDATA%\pgp_vault`
+3. GPG is auto-detected from your system PATH / Git / GnuPG install
+4. On first launch a browser warning about unsafe cert is expected —
+   click **Advanced → Proceed to localhost (unsafe)**
+5. Data (DB, TLS certs, auth token) stored in `%LOCALAPPDATA%\pgp_vault`
 
 ### GPG Detection
 
@@ -603,28 +615,30 @@ The EXE looks for GPG in this order:
 4. `C:\Program Files (x86)\GnuPG\bin\gpg.exe`
 5. Prompts to install GnuPG from gpg4win.org
 
-### Build Desktop EXE Manually
+### Build Manually
 
 ```batch
 pip install flask flask-cors zeroconf pyinstaller
 python -m PyInstaller desktop\pgpvault.spec
-# Output: desktop\dist\pgpvault.exe
+# Output: desktop\dist\pgpvault\pgpvault.exe
 ```
 
 ---
 
 ## Mobile App — Flet
 
-A Flet-based mobile/desktop client app connects to the Flask server over HTTPS.
+A Flet-based mobile/desktop client connects to the Flask server over HTTPS.
 
 ### Build Desktop Client EXE
 
 ```batch
 pip install flet httpx
 cd pgp_mobile
-flet pack main.py --add-data "lib:lib" --product-name "PGP Vault" --company-name "EchoVault"
+flet pack main.py --add-data "..\pgpvault-ca.crt;." --add-data "lib;lib" --product-name "PGP Vault" --company-name "EchoVault" --distpath ..\mobile_dist -y
 # Output: mobile_dist\main.exe
 ```
+
+The CA cert is bundled in so the client trusts your self-signed server cert automatically.
 
 ### Build Android APK
 
@@ -638,18 +652,26 @@ flutter build apk --release          # outputs: build/app/outputs/flutter-apk/ap
 
 ### Connecting the Mobile App
 
+**Before connecting on Android:** install the CA cert as a trusted CA:
+
+1. Copy `pgpvault-ca.crt` from your desktop to your Android device
+2. Settings → Security → Encryption → Trusted credentials → Install from storage
+3. Select the `.crt` file
+
+Then connect:
+
 1. Start the desktop server (`pgpvault.exe` or `python pgp_webui.py`)
-2. On the desktop: open **Settings → Mobile API** — copy the `AUTH_TOKEN`
-3. In the mobile app: enter your desktop's LAN IP (e.g. `https://192.168.50.239:8765`) and the auth token
-4. For HTTPS: download the CA cert from **Settings → Mobile API → Download CA cert**, install it on your Android device as a trusted CA
+2. On desktop: **Settings → Mobile API** — copy the `AUTH_TOKEN`
+3. In the mobile app: enter your server URL (e.g. `https://192.168.50.239:8765`) and the auth token
+4. The app connects over HTTPS — no "unsafe" warning if the CA cert is installed
 
 ### Remote Access via VPN
 
-The mobile app connects over your LAN or a VPN tunnel:
+The mobile app works over LAN or a VPN tunnel — no port forwarding needed:
 
 - **WireGuard/OpenVPN**: connect your phone to the same VPN as the desktop
-- The mobile app uses the VPN IP of the desktop (e.g. `10.0.0.2:8765`)
-- No port forwarding or cloud relay needed
+- Use the VPN IP of your desktop (e.g. `https://10.0.0.2:8765`)
+- Install the CA cert on Android before connecting over VPN
 
 ---
 
