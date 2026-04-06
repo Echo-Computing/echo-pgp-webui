@@ -62,6 +62,32 @@ CERT_PATH = PGP_DIR / 'pgpvault.crt'
 KEY_PATH = PGP_DIR / 'pgpvault.key'
 CA_CERT_PATH = PGP_DIR / 'pgpvault-ca.crt'
 
+# ─── Web UI Basic Auth ─────────────────────────────────────────────────────────
+_WEB_AUTH_FILE = PGP_DIR / '.web_auth'
+
+def _load_web_auth():
+    """Load web UI credentials from PGP_DIR/.web_auth if it exists."""
+    if not _WEB_AUTH_FILE.exists():
+        return '', ''
+    try:
+        content = _WEB_AUTH_FILE.read_text().strip()
+        if ':' in content:
+            user, pw_hash = content.split(':', 1)
+            return user.strip(), pw_hash.strip()
+    except Exception:
+        pass
+    return '', ''
+
+_WEB_AUTH_USER, _WEB_AUTH_PASS_HASH = _load_web_auth()
+
+def _save_web_auth(user: str, pw_hash: str):
+    """Persist web UI credentials to .web_auth file."""
+    try:
+        _WEB_AUTH_FILE.write_text(f'{user}:{pw_hash}')
+        return True
+    except Exception:
+        return False
+
 sys.path.insert(0, str(PGP_DIR))
 
 # Resolve gpg executable at startup — avoids FileNotFoundError on Windows where
@@ -101,9 +127,41 @@ app.config['DB_PATH'] = DB_PATH
 # Enable CORS for mobile API clients
 CORS(app, resources={r"/api/*": {"origins": "*"}})
 
-# Global error handler — always log unhandled exceptions with full traceback
+# ─── Web UI Basic Auth ─────────────────────────────────────────────────────────
+# Optional: set PGP_WEBUI_USER and PGP_WEBUI_PASS_HASH to protect the web UI.
+# Without both set, the web UI is open (existing behaviour for LAN-only trusted networks).
+# Generate a password hash with:
+#   python -c "from werkzeug.security import generate_password_hash; print(generate_password_hash('yourpass'))"
+_WEB_AUTH_USER = os.environ.get('PGP_WEBUI_USER', '')
+_WEB_AUTH_PASS_HASH = os.environ.get('PGP_WEBUI_PASS_HASH', '')
+
+@app.before_request
+def require_basic_auth():
+    """Protect all non-API routes with HTTP Basic Auth if credentials are configured."""
+    from flask import request, make_response
+    # Skip auth for /api/* (Bearer token), /health, and static assets
+    if request.path.startswith('/api/') or request.path in ('/health', '/favicon.ico'):
+        return
+    # Reload credentials from file so Settings changes take effect immediately
+    _user, _pw_hash = _load_web_auth()
+    if not _user or not _pw_hash:
+        return  # Auth disabled — no password set yet, open access
+    from werkzeug.security import check_password_hash
+    auth = request.authorization
+    if not auth or auth.username != _user or not check_password_hash(_pw_hash, auth.password):
+        realm = "PGP Vault"
+        return make_response(
+            f'<h1>401 Unauthorized</h1><p>Set a web UI password in Settings to protect access.</p>',
+            401,
+            {'WWW-Authenticate': f'Basic realm="{realm}"'}
+        )
+
+# Global error handler — log unhandled exceptions but let Flask handle HTTP errors normally
 @app.errorhandler(Exception)
 def handle_exception(e):
+    from werkzeug.exceptions import HTTPException
+    if isinstance(e, HTTPException):
+        return None  # Let Flask handle HTTP exceptions (404, 405, etc.) normally
     logger.exception("Unhandled exception: %s", e)
     return f"<h1>Internal Server Error</h1><pre>{traceback.format_exc()}</pre>", 500
 
@@ -991,11 +1049,39 @@ def settings_page():
             elif guard_action == 'enable' and not passphrase:
                 msg = '<div class="alert error">Enable failed — passphrase required.</div>'
 
+        # Web UI Basic Auth password management
+        web_auth_action = request.form.get('web_auth_action', '')
+        if web_auth_action == 'disable':
+            try:
+                _WEB_AUTH_FILE.unlink()
+            except Exception:
+                pass
+            msg = '<div class="alert info">Web UI auth DISABLED — UI is open.</div>'
+        elif web_auth_action == 'set':
+            web_user = (request.form.get('web_user') or '').strip()
+            web_pass = request.form.get('web_pass', '')
+            web_pass2 = request.form.get('web_pass2', '')
+            if not web_user:
+                msg = '<div class="alert error">Username is required.</div>'
+            elif web_pass != web_pass2:
+                msg = '<div class="alert error">Passwords do not match.</div>'
+            elif not web_pass:
+                msg = '<div class="alert error">Password is required to enable auth.</div>'
+            else:
+                from werkzeug.security import generate_password_hash
+                pw_hash = generate_password_hash(web_pass)
+                if _save_web_auth(web_user, pw_hash):
+                    msg = f'<div class="alert success">Web UI auth ENABLED — username: {web_user}</div>'
+                else:
+                    msg = '<div class="alert error">Failed to save credentials.</div>'
+
     guard_on = settings.confirm_guard
     agent_ok = gpg_agent_status() == 'running'
     lockout = settings.lockout_active
     remaining = settings.lockout_remaining
     clipboard_sec = os.environ.get('PGP_CLIPBOARD_CLEAR_SECONDS', '30')
+    web_auth_user, _ = _load_web_auth()
+    web_auth_on = bool(web_auth_user)
 
     body = f'''
     {msg}
@@ -1020,6 +1106,31 @@ def settings_page():
       </div>
     </div>
     <a href="{url_for('kill_agent')}" class="btn danger" onclick="return confirm(\'Restart gpg-agent and clear all cached passphrases?\')">💀 Kill Agent (clear passphrase cache)</a>
+    </div>
+    <div class="card">
+    <h2>Web UI Password</h2>
+    <p style="color:#8b949e;font-size:0.85rem;margin-bottom:1rem">
+      Protect the web UI with HTTP Basic Auth — every browser tab and request requires this password. The mobile app uses Bearer token auth separately and is unaffected.
+      If no password is set the UI is open — anyone on the network can access it.
+    </p>
+    <form method="post" style="margin-bottom:1rem">
+    <input type="hidden" name="web_auth_action" value="set">
+    <div class="form-row">
+      <label for="web_user">Username</label>
+      <input type="text" name="web_user" id="web_user" value="{web_auth_user}" placeholder="admin" autocomplete="username">
+    </div>
+    <div class="form-row">
+      <label for="web_pass">Password</label>
+      <input type="password" name="web_pass" id="web_pass" placeholder="{'Leave blank to keep current' if web_auth_on else 'Enter a password to enable auth'}" autocomplete="current-password">
+    </div>
+    <div class="form-row">
+      <label for="web_pass2">Confirm Password</label>
+      <input type="password" name="web_pass2" id="web_pass2" placeholder="Repeat password" autocomplete="new-password">
+    </div>
+    <button type="submit" class="btn primary">{'Update' if web_auth_on else 'Enable Auth'}</button>
+    {' <button type="submit" name="web_auth_action" value="disable" class="btn" style="margin-left:0.5rem">Disable</button>' if web_auth_on else ''}
+    </form>
+    {'<p><span class="ok">Web UI is PROTECTED</span> — requests require this password.</p>' if web_auth_on else '<p><span class="warn">Web UI is OPEN</span> — anyone on your network can access it without a password.</p>'}
     </div>
     <div class="card">
     <h2>Confirmation Guard</h2>
@@ -1320,6 +1431,13 @@ gpg --armor --export your@email.com
     </div>
     '''
     return render('Key Management', 'settings', body, dark)
+
+# ─── Health check ────────────────────────────────────────────────────────────────
+
+@app.route('/health')
+def health():
+    """Public health endpoint — no auth required, used by monitoring."""
+    return {'status': 'ok', 'version': '1.9.1'}
 
 # ─── Favicon ─────────────────────────────────────────────────────────────────────
 
