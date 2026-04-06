@@ -12,18 +12,35 @@ def _get_bundled_ca_cert() -> str | None:
     """
     Return the path to the bundled CA cert if running as a bundled app
     (PyInstaller EXE or Flet APK), otherwise None.
-    On bundled apps the cert lives next to the executable / in resources.
+
+    Search order:
+    1. PyInstaller _MEIPASS bundle root (desktop EXE)
+    2. Flet app directory (next to main.py / main.exe)
+    3. Script directory (pgp_mobile/)
+    4. Parent of script directory (repo root — for dev runs from repo root)
+    5. Current working directory (for dev runs from pgp_tmp_restored/)
     """
+    candidates = []
+
     if getattr(sys, '_MEIPASS', None):
-        # PyInstaller one-folder EXE
-        cert_path = os.path.join(sys._MEIPASS, 'pgpvault-ca.crt')
-        if os.path.exists(cert_path):
-            return cert_path
-    # Flet APK / app bundle — resources are in the app directory
-    base = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    cert_path = os.path.join(base, 'pgpvault-ca.crt')
-    if os.path.exists(cert_path):
-        return cert_path
+        candidates.append(os.path.join(sys._MEIPASS, 'pgpvault-ca.crt'))
+
+    # Flet / PyInstaller app dir — next to the executable
+    app_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    candidates.extend([
+        os.path.join(app_dir, 'pgpvault-ca.crt'),
+        os.path.join(app_dir, 'pgpvault', 'pgpvault-ca.crt'),
+    ])
+
+    # Also check parent of pgp_mobile (repo root) — common in dev setups
+    candidates.append(os.path.join(os.path.dirname(app_dir), 'pgpvault-ca.crt'))
+
+    # CWD — when running from pgp_tmp_restored/ or the repo root
+    candidates.append(os.path.join(os.getcwd(), 'pgpvault-ca.crt'))
+
+    for path in candidates:
+        if os.path.exists(path):
+            return path
     return None
 
 
