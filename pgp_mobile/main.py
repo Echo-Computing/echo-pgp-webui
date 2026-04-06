@@ -23,7 +23,8 @@ def get_client():
     token = _token.current or ''
     if not url or not token:
         return None
-    return api_client_module.PGPVaultClient(url, token, verify_tls=True)
+    ca_cert = api_client_module._get_bundled_ca_cert()
+    return api_client_module.PGPVaultClient(url, token, verify_tls=True, ca_cert_path=ca_cert)
 
 # ─── Page: Connect ─────────────────────────────────────────────────────────────
 
@@ -47,7 +48,9 @@ def connect_page(page: Page):
         status_ref.current.value = 'Connecting...'
         page.update()
 
-        client = __import__('lib.api_client', fromlist=['PGVaultClient']).PGVaultClient(url, token, verify_tls=True)
+        import lib.api_client as api_module
+        ca_cert = api_module._get_bundled_ca_cert()
+        client = api_module.PGPVaultClient(url, token, verify_tls=True, ca_cert_path=ca_cert)
         ok, msg = client.test_connection()
         if ok:
             _server_url.current = url

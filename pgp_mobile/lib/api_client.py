@@ -3,19 +3,47 @@ pgp_mobile/lib/api_client.py — HTTP client for PGP Vault Flask server
 """
 
 import httpx
+import os
+import sys
 import urllib.parse
+
+
+def _get_bundled_ca_cert() -> str | None:
+    """
+    Return the path to the bundled CA cert if running as a bundled app
+    (PyInstaller EXE or Flet APK), otherwise None.
+    On bundled apps the cert lives next to the executable / in resources.
+    """
+    if getattr(sys, '_MEIPASS', None):
+        # PyInstaller one-folder EXE
+        cert_path = os.path.join(sys._MEIPASS, 'pgpvault-ca.crt')
+        if os.path.exists(cert_path):
+            return cert_path
+    # Flet APK / app bundle — resources are in the app directory
+    base = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    cert_path = os.path.join(base, 'pgpvault-ca.crt')
+    if os.path.exists(cert_path):
+        return cert_path
+    return None
 
 
 class PGPVaultClient:
     """HTTP client for the PGP Vault server API."""
 
-    def __init__(self, base_url: str, token: str, verify_tls: bool = True):
+    def __init__(self, base_url: str, token: str, verify_tls: bool = True, ca_cert_path: str | None = None):
         self.base_url = base_url.rstrip('/')
         self.token = token
-        self.verify_tls = verify_tls
+
+        # resolve verify — True means use system CAs + optional custom CA
+        if verify_tls is True:
+            bundled = _get_bundled_ca_cert()
+            self.verify_tls = ca_cert_path or bundled or True
+        else:
+            self.verify_tls = verify_tls
+
         self._client = httpx.Client(
             timeout=30.0,
-            verify=verify_tls,
+            verify=self.verify_tls,
             headers={'Authorization': f'Bearer {token}'},
         )
 

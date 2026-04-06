@@ -1,7 +1,7 @@
 """
 PyInstaller spec for PGP Vault Desktop EXE
 Run: pyinstaller desktop/pgpvault.spec
-Output: desktop/dist/pgpvault.exe
+Output: desktop/dist/pgpvault/
 
 NOTE: Paths below are relative to the spec file location so any user
 downloading the repo can build from their own machine without editing.
@@ -24,7 +24,11 @@ a = Analysis(
     [str(REPO_DIR / 'pgp_webui.py')],
     pathex=[str(REPO_DIR)],
     binaries=[],
-    datas=[],
+    # Bundle the CA cert so it's included in the EXE directory
+    # and the server can serve it to mobile clients for CA install
+    datas=[
+        (str(REPO_DIR / 'pgpvault-ca.crt'), '.'),
+    ],
     hiddenimports=[
         'flask', 'flask_cors', 'markupsafe', 'jinja2', 'werkzeug',
         'itsdangerous', 'click', 'blinker', 'zeroconf', 'ifaddr',

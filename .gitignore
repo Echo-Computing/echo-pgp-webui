@@ -19,7 +19,9 @@ pgp_mobile/build/
 .auth_token
 messages.db
 pgpvault.crt
+pgpvault.key
 pgpvault-ca.crt
+pgpvault-ca.key
 
 # Virtual environments
 venv/
