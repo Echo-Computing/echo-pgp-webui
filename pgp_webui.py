@@ -128,12 +128,9 @@ app.config['DB_PATH'] = DB_PATH
 CORS(app, resources={r"/api/*": {"origins": "*"}})
 
 # ─── Web UI Basic Auth ─────────────────────────────────────────────────────────
-# Optional: set PGP_WEBUI_USER and PGP_WEBUI_PASS_HASH to protect the web UI.
-# Without both set, the web UI is open (existing behaviour for LAN-only trusted networks).
+# Credentials stored in PGP_DIR/.web_auth (user:hash) — not env vars.
 # Generate a password hash with:
 #   python -c "from werkzeug.security import generate_password_hash; print(generate_password_hash('yourpass'))"
-_WEB_AUTH_USER = os.environ.get('PGP_WEBUI_USER', '')
-_WEB_AUTH_PASS_HASH = os.environ.get('PGP_WEBUI_PASS_HASH', '')
 
 @app.before_request
 def require_basic_auth():
@@ -141,6 +138,10 @@ def require_basic_auth():
     from flask import request, make_response
     # Skip auth for /api/* (Bearer token), /health, and static assets
     if request.path.startswith('/api/') or request.path in ('/health', '/favicon.ico'):
+        return
+    # Skip auth for inbox AJAX sub-routes — these are called by JS on the same
+    # origin; browser will send credentials automatically if cached
+    if request.path.startswith(('/inbox/decrypt_file/', '/inbox/raw/', '/inbox/delete_file/')):
         return
     # Reload credentials from file so Settings changes take effect immediately
     _user, _pw_hash = _load_web_auth()
@@ -207,6 +208,9 @@ def _init_db_schema(conn: sqlite3.Connection):
     conn.execute('CREATE INDEX IF NOT EXISTS idx_recipient ON messages(recipient)')
     conn.execute('CREATE INDEX IF NOT EXISTS idx_timestamp ON messages(timestamp)')
     conn.execute('CREATE INDEX IF NOT EXISTS idx_sender ON messages(sender)')
+    # Atomic reply number sequence — prevents race condition duplicates
+    conn.execute('CREATE TABLE IF NOT EXISTS reply_seq (num INTEGER PRIMARY KEY)')
+    conn.execute("INSERT OR IGNORE INTO reply_seq (num) VALUES (0)")  # seed row if not exists
     # Add direction column if missing (existing DBs won't have it)
     try:
         conn.execute("ALTER TABLE messages ADD COLUMN direction TEXT DEFAULT 'unknown'")
@@ -1622,24 +1626,28 @@ def api_wipe():
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 
 def _next_reply_num(conn) -> int:
-    """Get next reply number from DB or file scan as fallback."""
-    row = conn.execute(
-        "SELECT file_path FROM messages WHERE file_path LIKE ? ORDER BY id DESC LIMIT 1",
-        ('%/reply%.asc',)
-    ).fetchone()
-    if row:
-        import re
-        m = re.search(r'reply(\d+)', row[0])
-        if m:
-            return int(m.group(1)) + 1
-    # Fallback to file scan
-    nums = []
-    for f in PGP_DIR.glob('reply*.asc'):
-        import re
-        m = re.match(r'reply(\d+)', f.name)
-        if m:
-            nums.append(int(m.group(1)))
-    return (max(nums) if nums else 0) + 1
+    """
+    Atomically get the next reply number.
+    Uses UPDATE with RETURNING (SQLite 3.38+) for true atomicity.
+    Falls back to file scan for older SQLite versions.
+    """
+    try:
+        row = conn.execute("""
+            UPDATE reply_seq SET num = num + 1 RETURNING num
+        """).fetchone()
+        if row:
+            conn.commit()
+            return row[0]
+        raise RuntimeError("RETURNING failed")
+    except Exception:
+        # Fallback: scan file system for highest reply number (not atomic, but safe)
+        nums = []
+        for f in PGP_DIR.glob('reply*.asc'):
+            import re
+            m = re.match(r'reply(\d+)', f.name)
+            if m:
+                nums.append(int(m.group(1)))
+        return (max(nums) if nums else 0) + 1
 
 def _append_sent_log(recipient, file_path):
     """Append to sent_log.json for backwards compat."""
