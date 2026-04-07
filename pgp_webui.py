@@ -684,13 +684,13 @@ def compose():
     confirm_row_enc = f'''
     <div class="form-row">
       <label for="confirm_phrase">Confirmation phrase {"" if guard_on else "(guard OFF)"}</label>
-      <input type="password" name="confirm_phrase" id="confirm_phrase" placeholder="{'vaultbot' if guard_on else 'guard is off'}">
+      <input type="password" name="confirm_phrase" id="confirm_phrase" autocomplete="off" placeholder="{'vaultbot' if guard_on else 'guard is off'}">
     </div>''' if guard_on else ''
 
     confirm_row_dec = f'''
     <div class="form-row">
       <label for="confirm_phrase_dec">Confirmation phrase {"" if guard_on else "(guard OFF)"}</label>
-      <input type="password" name="confirm_phrase_dec" id="confirm_phrase_dec" placeholder="{'vaultbot' if guard_on else 'guard is off'}">
+      <input type="password" name="confirm_phrase_dec" id="confirm_phrase_dec" autocomplete="off" placeholder="{'vaultbot' if guard_on else 'guard is off'}">
     </div>''' if guard_on else ''
 
     body = f'''
@@ -1177,7 +1177,7 @@ def settings_page():
     </div>
     <div class="form-row" style="margin-top:1rem;">
       <label for="passphrase_input">Passphrase — {'currently set' if settings.confirm_passphrase else 'not set'}</label>
-      <input type="password" name="passphrase" id="passphrase_input" placeholder="Enter phrase to activate guard...">
+      <input type="password" name="passphrase" id="passphrase_input" autocomplete="new-password" placeholder="Enter phrase to activate guard...">
     </div>
     <button type="submit" class="btn primary">Apply</button>
     </form>
