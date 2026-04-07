@@ -135,7 +135,9 @@ CORS(app, resources={r"/api/*": {"origins": "*"}})
 @app.before_request
 def require_basic_auth():
     """Protect all non-API routes with HTTP Basic Auth if credentials are configured."""
-    from flask import request, make_response
+    from flask import request, make_response, g
+    # Track current user for header display
+    g.current_user = None
     # Skip auth for /api/* (Bearer token), /health, and static assets
     if request.path.startswith('/api/') or request.path in ('/health', '/favicon.ico'):
         return
@@ -156,6 +158,7 @@ def require_basic_auth():
             401,
             {'WWW-Authenticate': f'Basic realm="{realm}"'}
         )
+    g.current_user = _user
 
 # Global error handler — log unhandled exceptions but let Flask handle HTTP errors normally
 @app.errorhandler(Exception)
@@ -391,37 +394,42 @@ settings = Settings()
 
 DARK_CSS = """
 * { box-sizing: border-box; margin: 0; padding: 0; }
-body { background: #0d1117; color: #e6edf3; font-family: 'Courier New', monospace; min-height: 100vh; }
+body { background: #0d1117; color: #e6edf3; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif; font-size: 15px; line-height: 1.6; min-height: 100vh; }
 a { color: #58a6ff; text-decoration: none; }
 a:hover { text-decoration: underline; }
 .container { max-width: 1100px; margin: 0 auto; padding: 2rem 1rem; }
-header { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 0.5rem; padding: 1rem 0; border-bottom: 1px solid #30363d; margin-bottom: 2rem; }
-header h1 { font-size: 1.2rem; color: #58a6ff; }
-header .links a { margin-left: 1.5rem; color: #8b949e; font-size: 0.9rem; }
-header .links a.active { color: #e6edf3; }
+header { background: linear-gradient(160deg, #1c2128 0%, #161b22 60%, #1a2332 100%); border: 1px solid #30363d; border-radius: 10px; padding: 1rem 1.5rem; margin-bottom: 2rem; box-shadow: 0 4px 20px rgba(0,0,0,0.4), 0 0 0 1px #58a6ff08; display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 0.5rem; }
+header h1 { font-size: 1.1rem; font-weight: 700; color: #58a6ff; letter-spacing: -0.02em; text-shadow: 0 0 20px #58a6ff50; }
+.header-brand { display: flex; align-items: center; gap: 0.6rem; }
+.header-brand-icon { font-size: 1.3rem; filter: drop-shadow(0 0 8px #58a6ff60); }
+.header-right { display: flex; align-items: center; gap: 0.75rem; flex-wrap: wrap; }
+.header-user { font-size: 0.82rem; color: #8b949e; background: #161b22; border: 1px solid #30363d; padding: 0.3rem 0.8rem; border-radius: 20px; font-weight: 500; }
+header .links a { margin-left: 1.5rem; color: #8b949e; font-size: 0.9rem; transition: color 0.2s ease; text-decoration: none; }
+header .links a.active { color: #e6edf3; text-shadow: 0 0 10px #58a6ff80; }
 header .links a:hover { color: #e6edf3; }
-.btn { display: inline-block; padding: 0.4rem 1rem; border-radius: 6px; border: 1px solid #30363d; background: #21262d; color: #e6edf3; cursor: pointer; font-size: 0.85rem; font-family: inherit; }
-.btn:hover { background: #30363d; }
+.btn { display: inline-flex; align-items: center; justify-content: center; gap: 0.3rem; padding: 0.4rem 1rem; border-radius: 6px; border: 1px solid #30363d; background: #21262d; color: #e6edf3; cursor: pointer; font-size: 0.85rem; font-family: inherit; font-weight: 500; transition: all 0.15s ease; white-space: nowrap; }
+.btn:hover { background: #30363d; transform: translateY(-1px); box-shadow: 0 3px 8px rgba(0,0,0,0.3); }
 .btn.danger { border-color: #f85149; color: #f85149; }
 .btn.danger:hover { background: #f8514922; }
 .btn.primary { background: #238636; border-color: #238636; }
-.btn.primary:hover { background: #2ea043; }
-.card { background: #161b22; border: 1px solid #30363d; border-radius: 6px; padding: 1.5rem; margin-bottom: 1.5rem; }
-.card h2 { font-size: 0.9rem; color: #8b949e; text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 1rem; }
+.btn.primary:hover { background: #2ea043; transform: translateY(-1px); box-shadow: 0 3px 12px rgba(46,160,67,0.4); }
+.card { background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 0; margin-bottom: 1.5rem; box-shadow: 0 4px 20px rgba(0,0,0,0.35); overflow: hidden; }
+.card h2 { font-size: 0.75rem; font-weight: 700; color: #8b949e; text-transform: uppercase; letter-spacing: 0.1em; margin-bottom: 0; padding: 0.9rem 1.25rem 0.8rem; border-bottom: 1px solid #21262d; border-left: 3px solid #30363d; background: linear-gradient(135deg, #1c2128 0%, #161b22 100%); }
+.card > *:not(h2) { padding: 1.1rem 1.25rem; }
 label { display: block; margin-bottom: 0.5rem; color: #8b949e; font-size: 0.85rem; }
-input[type=text], input[type=password], textarea, select { width: 100%; background: #0d1117; border: 1px solid #30363d; border-radius: 6px; color: #e6edf3; padding: 0.6rem; font-family: 'Courier New', monospace; font-size: 0.9rem; }
-input:focus, textarea:focus, select:focus { outline: none; border-color: #58a6ff; }
+input[type=text], input[type=password], textarea, select { width: 100%; background: #0d1117; border: 1px solid #30363d; border-radius: 6px; color: #e6edf3; padding: 0.6rem; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif; font-size: 0.9rem; transition: border-color 0.15s ease, box-shadow 0.15s ease; }
+input:focus, textarea:focus, select:focus { outline: none; border-color: #58a6ff; box-shadow: 0 0 0 3px #58a6ff22; }
 textarea { resize: vertical; min-height: 150px; }
 .form-row { margin-bottom: 1rem; }
 .form-row label { margin-bottom: 0.3rem; }
 .status-bar { display: flex; gap: 1.5rem; flex-wrap: wrap; margin-bottom: 1.5rem; }
-.status-item { background: #161b22; border: 1px solid #30363d; border-radius: 6px; padding: 0.6rem 1rem; font-size: 0.8rem; }
+.status-item { background: #161b22; border: 1px solid #30363d; border-radius: 6px; padding: 0.6rem 1rem; font-size: 0.8rem; box-shadow: 0 2px 6px rgba(0,0,0,0.2); }
 .status-item .label { color: #8b949e; }
 .status-item .value { color: #e6edf3; margin-left: 0.5rem; }
 .status-item .value.ok { color: #3fb950; }
 .status-item .value.warn { color: #d29922; }
 .status-item .value.danger { color: #f85149; }
-table { width: 100%; border-collapse: collapse; font-size: 0.85rem; }
+table { width: 100%; border-collapse: collapse; font-size: 0.85rem; table-layout: auto; }
 th { text-align: left; color: #8b949e; border-bottom: 1px solid #30363d; padding: 0.5rem; }
 td { padding: 0.5rem; border-bottom: 1px solid #21262d; }
 tr:hover td { background: #21262d; }
@@ -433,16 +441,24 @@ tr:hover td { background: #21262d; }
 .toggle .slider:before { content: ''; position: absolute; width: 14px; height: 14px; left: 3px; bottom: 3px; background: #8b949e; border-radius: 50%; transition: 0.2s; }
 .toggle input:checked + .slider { background: #238636; }
 .toggle input:checked + .slider:before { transform: translateX(20px); background: #fff; }
-.alert { padding: 0.8rem 1rem; border-radius: 6px; margin-bottom: 1rem; font-size: 0.85rem; }
+.alert { padding: 0.8rem 1rem; border-radius: 6px; margin-bottom: 1rem; font-size: 0.85rem; border-left: 3px solid; }
 .alert.success { background: #0d2119; border: 1px solid #3fb950; color: #3fb950; }
 .alert.error { background: #2d1117; border: 1px solid #f85149; color: #f85149; }
 .alert.info { background: #0d1726; border: 1px solid #58a6ff; color: #58a6ff; }
 .output-block { background: #0d1117; border: 1px solid #30363d; border-radius: 6px; padding: 1rem; font-size: 0.8rem; white-space: pre-wrap; word-break: break-all; max-height: 300px; overflow-y: auto; }
 .grid2 { display: flex; gap: 1rem; flex-wrap: wrap; }
 .grid2 > .card { flex: 1 1 380px; }
-table { table-layout: fixed; }
+table { table-layout: auto; }
 td { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 td code { overflow: hidden; text-overflow: ellipsis; display: block; }
+td.col-actions { white-space: nowrap; overflow: visible; }
+td.col-fprint { font-family: 'Courier New', Courier, monospace; font-size: 0.78rem; color: #8b949e; }
+@keyframes fadeSlideIn { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
+.card { animation: fadeSlideIn 0.35s ease forwards; }
+.card:nth-child(2) { animation-delay: 0.05s; }
+.card:nth-child(3) { animation-delay: 0.10s; }
+.card:nth-child(4) { animation-delay: 0.15s; }
+.card:nth-child(5) { animation-delay: 0.20s; }
 """
 
 LIGHT_CSS = """
@@ -451,27 +467,32 @@ body { background: #f6f8fa; color: #1f2328; font-family: 'Courier New', monospac
 a { color: #0969da; text-decoration: none; }
 a:hover { text-decoration: underline; }
 .container { max-width: 1100px; margin: 0 auto; padding: 2rem 1rem; }
-header { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 0.5rem; padding: 1rem 0; border-bottom: 1px solid #d0d7de; margin-bottom: 2rem; }
-header h1 { font-size: 1.2rem; color: #0969da; }
-header .links a { margin-left: 1.5rem; color: #57606a; font-size: 0.9rem; }
-header .links a.active { color: #1f2328; }
+header { background: linear-gradient(160deg, #ffffff 0%, #f6f8fa 60%, #f0f2f5 100%); border: 1px solid #d0d7de; border-radius: 10px; padding: 1rem 1.5rem; margin-bottom: 2rem; box-shadow: 0 4px 20px rgba(0,0,0,0.08), 0 0 0 1px #0969da08; display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 0.5rem; }
+header h1 { font-size: 1.1rem; font-weight: 700; color: #0969da; letter-spacing: -0.02em; text-shadow: 0 0 20px #0969da30; }
+.header-brand { display: flex; align-items: center; gap: 0.6rem; }
+.header-brand-icon { font-size: 1.3rem; filter: drop-shadow(0 0 8px #0969da40); }
+.header-right { display: flex; align-items: center; gap: 0.75rem; flex-wrap: wrap; }
+.header-user { font-size: 0.82rem; color: #57606a; background: #ffffff; border: 1px solid #d0d7de; padding: 0.3rem 0.8rem; border-radius: 20px; font-weight: 500; }
+header .links a { margin-left: 1.5rem; color: #57606a; font-size: 0.9rem; transition: color 0.2s ease; text-decoration: none; }
+header .links a.active { color: #1f2328; text-shadow: 0 0 10px #0969da60; }
 header .links a:hover { color: #1f2328; }
-.btn { display: inline-block; padding: 0.4rem 1rem; border-radius: 6px; border: 1px solid #d0d7de; background: #f6f8fa; color: #1f2328; cursor: pointer; font-size: 0.85rem; font-family: inherit; }
-.btn:hover { background: #eaeef2; }
+.btn { display: inline-flex; align-items: center; justify-content: center; gap: 0.3rem; padding: 0.4rem 1rem; border-radius: 6px; border: 1px solid #d0d7de; background: #f6f8fa; color: #1f2328; cursor: pointer; font-size: 0.85rem; font-family: inherit; font-weight: 500; transition: all 0.15s ease; white-space: nowrap; }
+.btn:hover { background: #eaeef2; transform: translateY(-1px); box-shadow: 0 3px 8px rgba(0,0,0,0.1); }
 .btn.danger { border-color: #cf222e; color: #cf222e; }
 .btn.danger:hover { background: #ffebe9; }
 .btn.primary { background: #2da44e; border-color: #2da44e; color: #fff; }
-.btn.primary:hover { background: #2c974b; }
-.card { background: #fff; border: 1px solid #d0d7de; border-radius: 6px; padding: 1.5rem; margin-bottom: 1.5rem; }
-.card h2 { font-size: 0.9rem; color: #57606a; text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 1rem; }
+.btn.primary:hover { background: #2c974b; transform: translateY(-1px); box-shadow: 0 3px 12px rgba(45,164,78,0.35); }
+.card { background: #fff; border: 1px solid #d0d7de; border-radius: 8px; padding: 0; margin-bottom: 1.5rem; box-shadow: 0 4px 20px rgba(0,0,0,0.08); overflow: hidden; }
+.card h2 { font-size: 0.75rem; font-weight: 700; color: #57606a; text-transform: uppercase; letter-spacing: 0.1em; margin-bottom: 0; padding: 0.9rem 1.25rem 0.8rem; border-bottom: 1px solid #eaeef2; border-left: 3px solid #d0d7de; background: linear-gradient(135deg, #f6f8fa 0%, #ffffff 100%); }
+.card > *:not(h2) { padding: 1.1rem 1.25rem; }
 label { display: block; margin-bottom: 0.5rem; color: #57606a; font-size: 0.85rem; }
 input[type=text], input[type=password], textarea, select { width: 100%; background: #fff; border: 1px solid #d0d7de; border-radius: 6px; color: #1f2328; padding: 0.6rem; font-family: 'Courier New', monospace; font-size: 0.9rem; }
-input:focus, textarea:focus, select:focus { outline: none; border-color: #0969da; }
+input:focus, textarea:focus, select:focus { outline: none; border-color: #0969da; box-shadow: 0 0 0 3px #0969da22; }
 textarea { resize: vertical; min-height: 150px; }
 .form-row { margin-bottom: 1rem; }
 .form-row label { margin-bottom: 0.3rem; }
 .status-bar { display: flex; gap: 1.5rem; flex-wrap: wrap; margin-bottom: 1.5rem; }
-.status-item { background: #fff; border: 1px solid #d0d7de; border-radius: 6px; padding: 0.6rem 1rem; font-size: 0.8rem; }
+.status-item { background: #fff; border: 1px solid #d0d7de; border-radius: 6px; padding: 0.6rem 1rem; font-size: 0.8rem; box-shadow: 0 2px 6px rgba(0,0,0,0.06); }
 .status-item .label { color: #57606a; }
 .status-item .value { color: #1f2328; margin-left: 0.5rem; }
 .status-item .value.ok { color: #2da44e; }
@@ -515,8 +536,13 @@ BASE_TEMPLATE = """
 <body data-dark="{{ '1' if dark_mode else '0' }}">
 <div class="container">
 <header>
-  <h1>🔐 PGP Vault</h1>
-  <div class="links">
+  <div class="header-brand">
+    <span class="header-brand-icon">🔐</span>
+    <h1>PGP Vault</h1>
+  </div>
+  <div class="header-right">
+    {% if current_user %}<span class="header-user">{{ current_user }}</span>{% endif %}
+    <div class="links">
     {% for endpoint, label in tabs %}
     <a href="{{ url_for(endpoint) }}" class="{{ 'active' if active_tab == endpoint else '' }}">{{ label }}</a>
     {% endfor %}
@@ -545,7 +571,8 @@ if(tc)tc.textContent=tc.textContent.replace(//g,'{').replace(//g,'}');
 </html>
 """
 
-def render(title, active_tab, body_html, dark_mode=True, set_cookie=False):
+def render(title, active_tab, body_html, dark_mode=True, set_cookie=False, current_user=None):
+    from flask import g
     css_raw = DARK_CSS if dark_mode else LIGHT_CSS
     css_safe = css_raw.replace('{', '\x01').replace('}', '\x02')
     tab_links = [
@@ -565,6 +592,7 @@ def render(title, active_tab, body_html, dark_mode=True, set_cookie=False):
         light_css=LIGHT_CSS,
         page_css=css_safe,
         url_for=url_for,
+        current_user=getattr(g, 'current_user', None),
     )
     resp = app.make_response(html)
     if set_cookie:
