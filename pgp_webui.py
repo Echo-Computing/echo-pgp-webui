@@ -742,7 +742,7 @@ def compose():
     </div>
     {output}'''
     # Draft auto-save/restore via localStorage
-    body += '''
+    body += f'''
     <script>
     const DRAFT_KEY = 'pgp_compose_draft';
     function saveDraft() {{
