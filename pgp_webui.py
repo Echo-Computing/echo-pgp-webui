@@ -684,7 +684,7 @@ def compose():
     confirm_row_enc = f'''
     <div class="form-row">
       <label for="confirm_phrase">Confirmation phrase {"" if guard_on else "(guard OFF)"}</label>
-      <input type="password" name="confirm_phrase" id="confirm_phrase" id="confirm_phrase" placeholder="{'vaultbot' if guard_on else 'guard is off'}">
+      <input type="password" name="confirm_phrase" id="confirm_phrase" placeholder="{'vaultbot' if guard_on else 'guard is off'}">
     </div>''' if guard_on else ''
 
     confirm_row_dec = f'''
@@ -715,10 +715,7 @@ def compose():
         <label for="message">Plaintext message <span id="draftIndicator" style="color:#8b949e;font-weight:normal;font-size:0.8rem;display:none"> · Draft saved</span></label>
         <textarea name="message" id="message" placeholder="Your message..." oninput="saveDraft()"></textarea>
       </div>
-      <div class="form-row" style="margin-top:-0.5rem">
-        <label></label>
-        <span style="color:#8b949e;font-size:0.75rem">Draft auto-saved locally</span>
-      </div>
+      <p style="color:#8b949e;font-size:0.75rem;margin:0">Draft auto-saved locally</p>
       {confirm_row_enc}
       <button type="submit" class="btn primary">🔒 Encrypt & Save</button>
     </form>
