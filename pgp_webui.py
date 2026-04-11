@@ -125,8 +125,19 @@ app = Flask(__name__)
 app.config['PGP_DIR'] = PGP_DIR
 app.config['DB_PATH'] = DB_PATH
 
-# Enable CORS for API clients
-CORS(app, resources={r"/api/*": {"origins": "*"}})
+# Enable CORS for API clients — restricted to same origin
+CORS(app, resources={r"/api/*": {"origins": os.environ.get('PGP_CORS_ORIGINS', '').split(',') if os.environ.get('PGP_CORS_ORIGINS') else []}})
+
+
+@app.after_request
+def set_security_headers(response):
+    """Add security headers to all responses."""
+    response.headers['X-Frame-Options'] = 'DENY'
+    response.headers['X-Content-Type-Options'] = 'nosniff'
+    response.headers['X-XSS-Protection'] = '1; mode=block'
+    response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
+    response.headers['Content-Security-Policy'] = "default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'"
+    return response
 
 # ─── Session DB Infrastructure ─────────────────────────────────────────────────
 
@@ -222,6 +233,21 @@ def record_failed_attempt(ip_address: str, username: str = None):
     conn.commit()
     auth_log = _get_auth_logger()
     auth_log.warning('LOGIN FAILED ip=%s user=%s', ip_address, username or 'unknown')
+
+
+def record_login_attempt(ip_address: str, username: str, success: bool):
+    """Record a login attempt (success or failure)."""
+    conn = _get_session_db()
+    conn.execute(
+        "INSERT INTO login_attempts (ip_address, username, success) VALUES (?, ?, ?)",
+        (ip_address, username, 1 if success else 0)
+    )
+    conn.commit()
+    auth_log = _get_auth_logger()
+    if success:
+        auth_log.info('LOGIN SUCCESS ip=%s user=%s', ip_address, username)
+    else:
+        auth_log.warning('LOGIN FAILED ip=%s user=%s', ip_address, username)
 
 
 def clear_failed_attempts(ip_address: str, username: str = None):
@@ -325,10 +351,12 @@ def auth_middleware():
         auth = request.headers.get('Authorization', '')
         if auth.startswith('Bearer '):
             token = auth[7:]
-            if token == AUTH_TOKEN:
+            if secrets.compare_digest(token, AUTH_TOKEN):
                 # API access with valid token — set a minimal g.current_user
                 g.current_user = {'username': 'api', 'pgp_key_email': 'api', 'is_admin': 0}
-        return
+                return
+        # Invalid or missing token — reject
+        return jsonify({'error': 'Unauthorized'}), 401
     # All other routes: session cookie required
     session_id = request.cookies.get(SESSION_COOKIE)
     if session_id:
@@ -377,7 +405,7 @@ def handle_exception(e):
     if isinstance(e, HTTPException):
         return None  # Let Flask handle HTTP exceptions (404, 405, etc.) normally
     logger.exception("Unhandled exception: %s", e)
-    return f"<h1>Internal Server Error</h1><pre>{traceback.format_exc()}</pre>", 500
+    return "<h1>Internal Server Error</h1><p>An unexpected error occurred.</p>", 500
 
 # ─── Login / Logout ─────────────────────────────────────────────────────────────
 
@@ -444,15 +472,15 @@ def login_page():
     if user_row and check_password_hash(user_row['password_hash'], password):
         # Successful login
         clear_failed_attempts(ip_address, username)
-        record_failed_attempt(ip_address, username)  # log success
+        record_login_attempt(ip_address, username, success=True)
         session_id = create_session(user_row['id'])
         resp = app.make_response(redirect(url_for('compose')))
         resp.set_cookie(SESSION_COOKIE, session_id, max_age=SESSION_EXPIRY_SECONDS,
-                        httponly=True, samesite='Lax')
+                        httponly=True, samesite='Lax', secure=True)
         return resp
     else:
         # Failed login
-        record_failed_attempt(ip_address, username)
+        record_login_attempt(ip_address, username, success=False)
         # Refresh lockout check after recording
         blocked, block_reason = check_login_attempts(ip_address, username)
         if blocked:
@@ -1380,17 +1408,20 @@ def compose():
 
                     output = f'<div class="alert success">Message encrypted and delivered to {recipient_email}.</div>'
                 else:
-                    alert = f'<div class="alert error">Encryption failed: {err}</div>'
+                    alert = f'<div class="alert error">Encryption failed: {html.escape(err)}</div>'
         elif action == 'decrypt':
             ciphertext = request.form.get('ciphertext', '').strip()
-            if not username:
+            confirm_dec = request.form.get('confirm_phrase_dec', '').strip()
+            if settings.confirm_guard and confirm_dec != settings.confirm_passphrase:
+                alert = '<div class="alert error">Confirmation phrase mismatch.</div>'
+            elif not username:
                 alert = '<div class="alert error">You must be logged in to decrypt.</div>'
             elif ciphertext:
                 out, err, code = decrypt_with_user_key(ciphertext, username)
                 if code == 0:
                     output = f'<div class="alert success">Decrypted:</div><div class="output-block">{out}</div>'
                 else:
-                    alert = f'<div class="alert error">Decryption failed: {err}</div>'
+                    alert = f'<div class="alert error">Decryption failed: {html.escape(err)}</div>'
 
     guard_on = settings.confirm_guard
 
@@ -1543,25 +1574,30 @@ def inbox():
     for m in messages[:30]:
         has_id = m['id'] is not None
         trash = '🗑'
+        safe_file = json.dumps(m['file'])
+        safe_file_html = html.escape(m['file'])
+        safe_sender = html.escape(m.get('sender', ''))
+        safe_sender_js = json.dumps(m.get('sender', ''))
+        safe_subject = html.escape(m.get('subject', '')[:40])
         delete_btn = f'<button class="btn danger" onclick="deleteMsg({m["id"]}, this)">{trash} Delete</button>' if has_id else \
-                     f'<button class="btn danger" onclick="deleteFile(\'{m["file"]}\', this)">{trash} Delete</button>'
+                     f'<button class="btn danger" onclick="deleteFile({safe_file}, this)">{trash} Delete</button>'
         row_style = '' if m.get('read') else 'font-weight:bold'
         read_icon = '✓ ' if m.get('read') else ''
         html_rows += f'''<tr data-id="{m['id']}" style="{row_style}">
           <td style="text-align:center"><input type="checkbox" class="row-check" value="{m["id"]}" onclick="updateBulkBtn()"></td>
-          <td><code>{read_icon}{m['file']}</code></td>
-          <td>{m.get('sender','')}</td>
-          <td>{m.get('subject','')[:40]}</td>
+          <td><code>{read_icon}{safe_file_html}</code></td>
+          <td>{safe_sender}</td>
+          <td>{safe_subject}</td>
           <td>{m.get('timestamp','')[:16]}</td>
           <td>
-            <button class="btn" onclick="decryptFile('{m['file']}', this)">🔓 Decrypt</button>
-            <button class="btn" onclick="window.location='/compose?reply_to={m.get('sender','')}'">↩ Reply</button>
-            <button class="btn" onclick="copyFile('{m['file']}', this)">📋 Copy</button>
+            <button class="btn" onclick="decryptFile({safe_file}, this)">🔓 Decrypt</button>
+            <button class="btn" onclick="window.location='/compose?reply_to={safe_sender_js}'">↩ Reply</button>
+            <button class="btn" onclick="copyFile({safe_file}, this)">📋 Copy</button>
             {delete_btn}
           </td>
         </tr>
-        <tr class="decrypted-row" id="row-{m['file']}" style="display:none">
-          <td colspan="6"><div class="decrypted-content" id="content-{m['file']}"></div></td>
+        <tr class="decrypted-row" id="row-{safe_file_html}" style="display:none">
+          <td colspan="6"><div class="decrypted-content" id="content-{safe_file_html}"></div></td>
         </tr>'''
 
     body = f'''
@@ -1770,8 +1806,8 @@ def sent():
         for r in rows:
             rows_html += f'''<tr>
               <td>{r['timestamp'][:16]}</td>
-              <td>{r['recipient']}</td>
-              <td><code>{r.get('subject', '')[:40]}</code></td>
+              <td>{html.escape(r['recipient'])}</td>
+              <td><code>{html.escape(r.get('subject', '')[:40])}</code></td>
             </tr>'''
 
     table_html = f'''<div class="card"><h2>Sent Messages</h2>
@@ -1783,6 +1819,7 @@ def sent():
     return render('Sent Messages', 'sent', body, dark)
 
 @app.route('/sent/clear')
+@admin_required
 def clear_sent_log():
     log_path = app.config['PGP_DIR'] / 'sent_log.json'
     if log_path.exists():
@@ -1826,8 +1863,8 @@ def settings_page():
     <div class="card">
     <h2>Your Account</h2>
     <table>
-      <tr><td>Username</td><td><code>{username}</code></td></tr>
-      <tr><td>PGP Email</td><td><code>{user_email}</code></td></tr>
+      <tr><td>Username</td><td><code>{html.escape(username)}</code></td></tr>
+      <tr><td>PGP Email</td><td><code>{html.escape(user_email)}</code></td></tr>
     </table>
     </div>
     <div class="card">
@@ -1937,6 +1974,7 @@ def serve_ca_cert():
     return resp
 
 @app.route('/settings/regen-token', methods=['POST'])
+@admin_required
 def regen_token():
     """Regenerate the API auth token."""
     global AUTH_TOKEN
@@ -1959,7 +1997,8 @@ def _get_lan_ip():
     except Exception:
         return '127.0.0.1'
 
-@app.route('/settings/kill-agent')
+@app.route('/settings/kill-agent', methods=['POST'])
+@admin_required
 def kill_agent():
     subprocess.run(['gpgconf', '--kill', 'gpg-agent'], capture_output=True)
     subprocess.run(['gpgconf', '--launch', 'gpg-agent'], capture_output=True)
@@ -1998,7 +2037,7 @@ def keys_page():
                         msg = '<div class="alert success">Key imported successfully!</div>'
                     keys_raw = list_public_keys(username)  # refresh
                 else:
-                    msg = f'<div class="alert error">Import failed: {err or out}</div>'
+                    msg = f'<div class="alert error">Import failed: {html.escape(err or out)}</div>'
         elif action == 'delete':
             key_id = request.form.get('key_id', '').strip()
             if key_id and username:
@@ -2009,7 +2048,7 @@ def keys_page():
                     msg = '<div class="alert success">Key deleted.</div>'
                     keys_raw = list_public_keys(username)
                 else:
-                    msg = f'<div class="alert error">Delete failed: {err}</div>'
+                    msg = f'<div class="alert error">Delete failed: {html.escape(err)}</div>'
 
     # Parse keys into structured display
     # Output with --keyid-format=long --fixed-list-mode looks like:
@@ -2189,11 +2228,14 @@ def api_messages():
     x_user = request.headers.get('X-User-ID', '').strip()
     if api_username == 'api' and x_user:
         # Validate X-User-ID exists in session DB
+        # Never copy is_admin — API users remain non-admin regardless of X-User-ID
+        if not re.match(r'^[a-zA-Z0-9_.-]{1,64}$', x_user):
+            return jsonify({'error': 'Invalid X-User-ID'}), 400
         sess_conn = _get_session_db()
-        user_row = sess_conn.execute('SELECT * FROM users WHERE username = ?', (x_user,)).fetchone()
+        user_row = sess_conn.execute('SELECT username, pgp_key_email FROM users WHERE username = ?', (x_user,)).fetchone()
         if user_row:
             api_username = x_user
-            g.current_user = dict(user_row)
+            g.current_user = {'username': user_row['username'], 'pgp_key_email': user_row['pgp_key_email'], 'is_admin': 0}
 
     if not api_username or api_username == 'api':
         return jsonify({'error': 'User context required. Use session cookie or X-User-ID header with Bearer token.'}), 401
@@ -2284,11 +2326,13 @@ def api_message(msg_id):
 
     x_user = request.headers.get('X-User-ID', '').strip()
     if api_username == 'api' and x_user:
+        if not re.match(r'^[a-zA-Z0-9_.-]{1,64}$', x_user):
+            return jsonify({'error': 'Invalid X-User-ID'}), 400
         sess_conn = _get_session_db()
-        user_row = sess_conn.execute('SELECT * FROM users WHERE username = ?', (x_user,)).fetchone()
+        user_row = sess_conn.execute('SELECT username, pgp_key_email FROM users WHERE username = ?', (x_user,)).fetchone()
         if user_row:
             api_username = x_user
-            g.current_user = dict(user_row)
+            g.current_user = {'username': user_row['username'], 'pgp_key_email': user_row['pgp_key_email'], 'is_admin': 0}
 
     if not api_username or api_username == 'api':
         return jsonify({'error': 'User context required'}), 401
@@ -2335,8 +2379,11 @@ def api_message(msg_id):
 def api_wipe():
     """
     Kill GPG agent, wipe all messages from DB, delete all reply*.asc files.
-    Requires {"confirm": "yes"} in body. Irreversible.
+    Requires {"confirm": "yes"} in body. Irreversible. Admin only.
     """
+    current_user = getattr(g, 'current_user', None)
+    if not current_user or current_user.get('is_admin') != 1:
+        return jsonify({'error': 'Admin access required'}), 403
     data = request.get_json(force=True) or {}
     if data.get('confirm') != 'yes':
         return jsonify({'error': 'Must pass {"confirm": "yes"} to confirm wipe'}), 400
