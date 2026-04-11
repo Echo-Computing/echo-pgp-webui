@@ -17,6 +17,7 @@ import threading
 import re
 import sqlite3
 import hashlib
+import html
 import secrets
 import ssl
 import socket
