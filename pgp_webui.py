@@ -1229,7 +1229,7 @@ BASE_TEMPLATE = """
     <h1>PGP Vault</h1>
   </div>
   <div class="header-right">
-    {% if current_user %}<span class="header-user">{{ current_user.username }}</span>{% endif %}
+    {% if current_user %}<span class="header-user">{{ current_user.username }}<form method="post" action="{{ url_for('logout') }}" style="display:inline;margin:0;padding:0 0 0 6px"><button type="submit" class="btn small" style="font-size:0.7rem;padding:1px 6px">Logout</button></form></span>{% endif %}
     <div class="links">
     {% for endpoint, label in tabs %}
     <a href="{{ url_for(endpoint) }}" class="{{ 'active' if active_tab == endpoint else '' }}">{{ label }}</a>
@@ -1238,9 +1238,6 @@ BASE_TEMPLATE = """
     <a href="{{ url_for('admin_users') }}" class="{{ 'active' if active_tab == 'admin_users' else '' }}">Admin</a>
     {% endif %}
     <a href="#" id="dark_toggle" onclick="toggleDark(); return false;" style="background:none;border:none;color:#8b949e;cursor:pointer;font-size:0.8rem;text-decoration:none">{{ '☀ light' if dark_mode else '🌙 dark' }}</a>
-    {% if current_user %}
-    <form method="post" action="{{ url_for('logout') }}" style="display:inline;margin:0;padding:0"><button type="submit" class="btn small" style="font-size:0.75rem;padding:2px 8px">Logout</button></form>
-    {% endif %}
   </div>
 </header>
 <script>
