@@ -139,7 +139,9 @@ def set_security_headers(response):
     response.headers['X-Content-Type-Options'] = 'nosniff'
     response.headers['X-XSS-Protection'] = '1; mode=block'
     response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
-    response.headers['Content-Security-Policy'] = "default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'"
+    response.headers['Content-Security-Policy'] = "default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; img-src 'self' data:; form-action 'self'; base-uri 'self'; object-src 'none'; frame-ancestors 'none'; connect-src 'self'"
+    response.headers['Referrer-Policy'] = 'strict-origin-when-cross-origin'
+    response.headers['Permissions-Policy'] = 'camera=(), microphone=(), geolocation=()'
     return response
 
 
@@ -348,6 +350,8 @@ def create_session(user_id: int) -> str:
         datetime.utcnow().timestamp() + SESSION_EXPIRY_SECONDS
     ).strftime('%Y-%m-%d %H:%M:%S')
     conn = _get_session_db()
+    # Purge expired sessions on each login to prevent accumulation
+    conn.execute("DELETE FROM sessions WHERE expires_at < datetime('now')")
     conn.execute(
         "INSERT INTO sessions (id, user_id, expires_at) VALUES (?, ?, ?)",
         (session_id, user_id, expires_at)
@@ -383,11 +387,11 @@ def admin_required(f):
     """Decorator requiring a valid admin session."""
     @wraps(f)
     def decorated(*args, **kwargs):
-        from flask import g, redirect
+        from flask import g
         if not hasattr(g, 'current_user') or not g.current_user:
             return redirect(url_for('login_page'))
         if g.current_user.get('is_admin') != 1:
-            return redirect(url_for('login_page'))
+            return '<h1>403 Forbidden</h1><p>You do not have permission to access this page.</p>', 403
         return f(*args, **kwargs)
     return decorated
 
@@ -554,7 +558,7 @@ def login_page():
             return resp, 429
         resp = app.make_response(_get_login_form('Invalid username or password'))
         _set_csrf_cookie(resp)
-        return resp, 200
+        return resp, 401
 
 
 @app.route('/logout', methods=['POST'])
@@ -566,6 +570,7 @@ def logout():
         delete_session(session_id)
     resp = app.make_response(redirect(url_for('login_page')))
     resp.set_cookie(SESSION_COOKIE, '', expires=0)
+    resp.set_cookie(CSRF_COOKIE, '', expires=0)
     return resp
 
 
@@ -660,7 +665,7 @@ def admin_unlock():
     count = admin_clear_lockout(ip_address=ip_address or None, username=username or None)
     resp = app.make_response(redirect(url_for('admin_audit')))
     if count > 0:
-        resp.set_cookie('flash', f'Unlocked {count} record(s)', max_age=30)
+        resp.set_cookie('flash', f'Unlocked {count} record(s)', max_age=30, samesite='Lax', secure=True)
     return resp
 
 
@@ -700,7 +705,7 @@ def admin_users():
                 if existing:
                     msg = '<div class="alert error">Username already exists.</div>'
                 else:
-                    pw_hash = generate_password_hash(password)
+                    pw_hash = generate_password_hash(password, method='pbkdf2:sha256', salt_length=32)
                     conn.execute(
                         'INSERT INTO users (username, password_hash, pgp_key_email, is_admin) VALUES (?, ?, ?, ?)',
                         (username, pw_hash, pgp_email, is_admin)
@@ -754,7 +759,7 @@ def admin_users():
             elif len(new_password) < 8:
                 msg = '<div class="alert error">Password must be at least 8 characters.</div>'
             elif user_id.isdigit():
-                pw_hash = generate_password_hash(new_password)
+                pw_hash = generate_password_hash(new_password, method='pbkdf2:sha256', salt_length=32)
                 conn.execute('UPDATE users SET password_hash = ? WHERE id = ?', (pw_hash, int(user_id)))
                 conn.commit()
                 msg = '<div class="alert success">Password reset.</div>'
@@ -880,7 +885,7 @@ def _init_admin_user(username: str, password: str, pgp_email: str):
     if len(password) < 8:
         print(f'[!] Password must be at least 8 characters.')
         sys.exit(1)
-    pw_hash = generate_password_hash(password)
+    pw_hash = generate_password_hash(password, method='pbkdf2:sha256', salt_length=32)
     conn = _get_session_db()
     conn.execute(
         'INSERT INTO users (username, password_hash, pgp_key_email, is_admin) VALUES (?, ?, ?, 1)',
@@ -1455,7 +1460,7 @@ def render(title, active_tab, body_html, dark_mode=True, set_cookie=False, curre
     )
     resp = app.make_response(html)
     if set_cookie:
-        resp.set_cookie(DARK_MODE_COOKIE, '0' if dark_mode else '1')
+        resp.set_cookie(DARK_MODE_COOKIE, '0' if dark_mode else '1', samesite='Lax', secure=True)
     _set_csrf_cookie(resp)
     return resp
 
@@ -1547,7 +1552,8 @@ def compose():
 
                     output = f'<div class="alert success">Message encrypted and delivered to {html.escape(recipient_email)}.</div>'
                 else:
-                    alert = f'<div class="alert error">Encryption failed: {html.escape(err)}</div>'
+                    logger.error('GPG encrypt failed: %s', err)
+                    alert = '<div class="alert error">Encryption failed. Check that the recipient\'s key is imported and valid.</div>'
         elif action == 'decrypt':
             ciphertext = request.form.get('ciphertext', '').strip()
             confirm_dec = request.form.get('confirm_phrase_dec', '').strip()
@@ -1560,7 +1566,8 @@ def compose():
                 if code == 0:
                     output = f'<div class="alert success">Decrypted:</div><div class="output-block">{html.escape(out)}</div>'
                 else:
-                    alert = f'<div class="alert error">Decryption failed: {html.escape(err)}</div>'
+                    logger.error('GPG decrypt failed: %s', err)
+                    alert = '<div class="alert error">Decryption failed. Check that you have the correct private key.</div>'
 
     guard_on = settings.confirm_guard
 
@@ -1886,7 +1893,8 @@ def inbox_decrypt_file(filename):
     out, err, code = decrypt_with_user_key(content, username)
     if code == 0:
         return jsonify({'plaintext': out})
-    return jsonify({'error': err or 'Decryption failed'}), 500
+    logger.error('Inbox decrypt failed for user %s file %s: %s', username, safe_name, err)
+    return jsonify({'error': 'Decryption failed'}), 500
 
 
 @app.route('/inbox/raw/<filename>')
@@ -2163,7 +2171,7 @@ def kill_agent():
 def toggle_dark_mode():
     dark = request.cookies.get(DARK_MODE_COOKIE, '1') == '1'
     resp = app.make_response(redirect(url_for('compose')))
-    resp.set_cookie(DARK_MODE_COOKIE, '0' if dark else '1')
+    resp.set_cookie(DARK_MODE_COOKIE, '0' if dark else '1', samesite='Lax', secure=True)
     return resp
 
 # ─── Key Management ─────────────────────────────────────────────────────────────
@@ -2212,7 +2220,8 @@ def keys_page():
                     msg = '<div class="alert success">Key deleted.</div>'
                     keys_raw = list_public_keys(username)
                 else:
-                    msg = f'<div class="alert error">Delete failed: {html.escape(err)}</div>'
+                    logger.error('GPG key delete failed for user %s: %s', username, err)
+                    msg = '<div class="alert error">Key deletion failed.</div>'
 
     # Parse keys into structured display
     # Output with --keyid-format=long --fixed-list-mode looks like:
@@ -2430,7 +2439,8 @@ def api_messages():
 
     out, err, code = encrypt_to_recipient(recipient_email, plaintext, username)
     if code != 0:
-        return jsonify({'error': f'Encryption failed: {err}'}), 500
+        logger.error('API encrypt failed for user %s: %s', username, err)
+        return jsonify({'error': 'Encryption failed'}), 500
 
     ts = datetime.utcnow().isoformat()
     h = hashlib.sha256(out.encode()).hexdigest()
@@ -2527,7 +2537,8 @@ def api_message(msg_id):
     # GET — decrypt
     plaintext, err, code = decrypt_with_user_key(row['encrypted_payload'], username)
     if code != 0:
-        return jsonify({'error': f'Decryption failed: {err}'}), 500
+        logger.error('API decrypt failed for user %s: %s', username, err)
+        return jsonify({'error': 'Decryption failed'}), 500
     return jsonify({
         'id': row['id'],
         'timestamp': row['timestamp'],
