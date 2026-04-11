@@ -16,7 +16,7 @@ import time
 import threading
 import re
 import sqlite3
-import hashlib
+import hmac
 import html
 import secrets
 import ssl
@@ -81,6 +81,7 @@ def _load_auth_token():
     token = secrets.token_hex(32)
     try:
         _AUTH_TOKEN_FILE.write_text(token)
+        _AUTH_TOKEN_FILE.chmod(0o600)
     except Exception:
         pass
     return token
@@ -613,6 +614,8 @@ def admin_users():
 
             if not username or not password or not pgp_email:
                 msg = '<div class="alert error">All fields are required.</div>'
+            elif len(password) < 8:
+                msg = '<div class="alert error">Password must be at least 8 characters.</div>'
             elif password != password2:
                 msg = '<div class="alert error">Passwords do not match.</div>'
             elif not re.match(r'^[a-zA-Z0-9_.-]{1,64}$', username):
@@ -675,6 +678,8 @@ def admin_users():
             new_password2 = request.form.get('new_password2', '')
             if not new_password or new_password != new_password2:
                 msg = '<div class="alert error">Passwords do not match or are empty.</div>'
+            elif len(new_password) < 8:
+                msg = '<div class="alert error">Password must be at least 8 characters.</div>'
             elif user_id.isdigit():
                 pw_hash = generate_password_hash(new_password)
                 conn.execute('UPDATE users SET password_hash = ? WHERE id = ?', (pw_hash, int(user_id)))
@@ -786,6 +791,9 @@ def _generate_gpg_key(username: str, email: str):
 
 def _init_admin_user(username: str, password: str, pgp_email: str):
     """Create the first admin user. Called via --init-admin CLI flag."""
+    if len(password) < 8:
+        print(f'[!] Password must be at least 8 characters.')
+        sys.exit(1)
     pw_hash = generate_password_hash(password)
     conn = _get_session_db()
     conn.execute(
@@ -1071,7 +1079,7 @@ def get_user_public_key_emails(exclude_username=None):
 
 class Settings:
     confirm_guard = False
-    confirm_passphrase = ''
+    confirm_passphrase_hash = ''  # SHA-256 hash of the passphrase
     clipboard_auto_clear = int(os.environ.get('PGP_CLIPBOARD_CLEAR_SECONDS', '30'))
     lockout_active = False
     lockout_remaining = int(os.environ.get('PGP_MAX_ATTEMPTS', '5'))
@@ -1079,7 +1087,7 @@ class Settings:
 
     @classmethod
     def guard_enabled(cls):
-        return cls.confirm_guard and bool(cls.confirm_passphrase)
+        return cls.confirm_guard and bool(cls.confirm_passphrase_hash)
 
     @classmethod
     def load_sent_log(cls):
@@ -1348,7 +1356,7 @@ def compose():
         recipient_email = request.form.get('recipient', '').strip()
         if action == 'encrypt' and msg and recipient_email:
             confirm = request.form.get('confirm_phrase', '').strip()
-            if settings.confirm_guard and confirm != settings.confirm_passphrase:
+            if settings.confirm_guard and not hmac.compare_digest(hashlib.sha256(confirm.encode()).hexdigest(), settings.confirm_passphrase_hash):
                 alert = '<div class="alert error">Confirmation phrase mismatch.</div>'
             elif not username:
                 alert = '<div class="alert error">You must be logged in to send messages.</div>'
@@ -1358,7 +1366,8 @@ def compose():
                     ts = datetime.utcnow().isoformat()
                     subject = request.form.get('subject', '')[:200]
                     h = hashlib.sha256(out.encode()).hexdigest()
-                    reply_num = settings.next_reply_num()
+                    sender_db = get_user_db(username)
+                    reply_num = _next_reply_num(sender_db)
 
                     # Write encrypted blob to SENDER's sent folder: users/{username}/sent/
                     sent_dir = USERS_DIR / username / 'sent'
@@ -1390,7 +1399,6 @@ def compose():
                         out_path_recv = out_path_sent  # fallback
 
                     # Record in SENDER's per-user DB as 'sent'
-                    sender_db = get_user_db(username)
                     sender_db.execute('''
                         INSERT INTO messages (timestamp, sender, sender_username, recipient, subject, file_path, content_hash, encrypted_payload, direction)
                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'sent')
@@ -1412,7 +1420,7 @@ def compose():
         elif action == 'decrypt':
             ciphertext = request.form.get('ciphertext', '').strip()
             confirm_dec = request.form.get('confirm_phrase_dec', '').strip()
-            if settings.confirm_guard and confirm_dec != settings.confirm_passphrase:
+            if settings.confirm_guard and not hmac.compare_digest(hashlib.sha256(confirm_dec.encode()).hexdigest(), settings.confirm_passphrase_hash):
                 alert = '<div class="alert error">Confirmation phrase mismatch.</div>'
             elif not username:
                 alert = '<div class="alert error">You must be logged in to decrypt.</div>'
@@ -1838,11 +1846,11 @@ def settings_page():
         passphrase = request.form.get('passphrase', '').strip()
         if guard_action == 'enable' and passphrase:
             settings.confirm_guard = True
-            settings.confirm_passphrase = passphrase
+            settings.confirm_passphrase_hash = hashlib.sha256(passphrase.encode()).hexdigest()
             msg = f'<div class="alert success">Guard ENABLED — phrase set.</div>'
         else:
             settings.confirm_guard = False
-            settings.confirm_passphrase = ''
+            settings.confirm_passphrase_hash = ''
             if guard_action == 'disable':
                 msg = '<div class="alert info">Guard DISABLED.</div>'
             elif guard_action == 'enable' and not passphrase:
@@ -1900,7 +1908,7 @@ def settings_page():
       </label>
     </div>
     <div class="form-row" style="margin-top:1rem;">
-      <label for="passphrase_input">Passphrase — {'currently set' if settings.confirm_passphrase else 'not set'}</label>
+      <label for="passphrase_input">Passphrase — {'currently set' if settings.confirm_passphrase_hash else 'not set'}</label>
       <input type="password" name="passphrase" id="passphrase_input" autocomplete="new-password" placeholder="Enter phrase to activate guard...">
     </div>
     <button type="submit" class="btn primary">Apply</button>
@@ -1981,6 +1989,7 @@ def regen_token():
     token = secrets.token_hex(32)
     try:
         _AUTH_TOKEN_FILE.write_text(token)
+        _AUTH_TOKEN_FILE.chmod(0o600)
     except Exception:
         pass
     AUTH_TOKEN = token
@@ -2191,7 +2200,7 @@ gpg --armor --export your@email.com
 @app.route('/health')
 def health():
     """Public health endpoint — no auth required, used by monitoring."""
-    return {'status': 'ok', 'version': '2.0.0'}
+    return {'status': 'ok', 'version': '2.1.0'}
 
 # ─── Favicon ─────────────────────────────────────────────────────────────────────
 
@@ -2268,7 +2277,8 @@ def api_messages():
 
     ts = datetime.utcnow().isoformat()
     h = hashlib.sha256(out.encode()).hexdigest()
-    reply_num = settings.next_reply_num()
+    sender_db = get_user_db(username)
+    reply_num = _next_reply_num(sender_db)
 
     # Write to sender's sent dir
     sent_dir = USERS_DIR / username / 'sent'
@@ -2291,7 +2301,6 @@ def api_messages():
         out_path_recv.write_text(out)
 
     # Record in sender's DB
-    sender_db = get_user_db(username)
     sender_db.execute('''
         INSERT INTO messages (timestamp, sender, sender_username, recipient, subject, file_path, content_hash, encrypted_payload, direction)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'sent')
@@ -2472,14 +2481,15 @@ def _ensure_tls_cert():
     try:
         import subprocess
         ca_key = PGP_DIR / 'pgpvault-ca.key'
+        ca_passphrase = secrets.token_hex(32)
         subprocess.run([
             'openssl', 'req', '-new', '-x509', '-days', '3650',
             '-subj', '/CN=PGPVaultCA/O=EchoVault',
             '-keyout', str(ca_key), '-out', str(CA_CERT_PATH),
-            '-passout', 'pass:pgpvaultca', '-nodes',
+            '-passout', f'pass:{ca_passphrase}', '-nodes',
         ], check=True, capture_output=True)
         subprocess.run([
-            'openssl', 'genrsa', '-out', str(KEY_PATH), '2048',
+            'openssl', 'genrsa', '-out', str(KEY_PATH), '4096',
         ], check=True, capture_output=True)
         hostname = socket.gethostname()
         subprocess.run([
@@ -2487,7 +2497,7 @@ def _ensure_tls_cert():
             '-subj', f'/CN={hostname}/O=PGPVault',
             '-key', str(KEY_PATH), '-out', str(CERT_PATH),
             '-CA', str(CA_CERT_PATH), '-CAkey', str(ca_key),
-            '-passin', 'pass:pgpvaultca', '-nodes',
+            '-passin', f'pass:{ca_passphrase}', '-nodes',
         ], check=True, capture_output=True)
         print(f"[*] Generated TLS certificates in {PGP_DIR}")
         print(f"[*] Download CA cert: http://localhost:{port}/settings/ca-cert")
