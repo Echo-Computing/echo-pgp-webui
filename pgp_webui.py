@@ -1228,7 +1228,7 @@ BASE_TEMPLATE = """
     <h1>PGP Vault</h1>
   </div>
   <div class="header-right">
-    {% if current_user %}<span class="header-user">{{ current_user }}</span>{% endif %}
+    {% if current_user %}<span class="header-user">{{ current_user.username }}</span>{% endif %}
     <div class="links">
     {% for endpoint, label in tabs %}
     <a href="{{ url_for(endpoint) }}" class="{{ 'active' if active_tab == endpoint else '' }}">{{ label }}</a>
