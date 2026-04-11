@@ -1,6 +1,6 @@
 # PGP Vault Web UI
 
-A standalone, self-hosted Flask web interface for GPG encrypt/decrypt operations. SQLite-backed message storage — everything stays on your machine.
+A standalone, self-hosted Flask web interface for GPG encrypt/decrypt operations. SQLite-backed message storage with multi-user support — everything stays on your machine.
 
 **Use cases:**
 - Encrypt messages to friends using their public PGP keys
@@ -20,18 +20,17 @@ pip install -r requirements-server.txt
 # Generate HTTPS certificates (run once before first launch)
 python tools/generate-cert.py
 
-# Configure your identity
-export PGP_SENDER_ID="you@yourdomain.com"
-export PGP_DIR="$HOME/.gnupg"
+# Create an admin account
+python pgp_webui.py --init-admin <username> <password> <email@example.com>
 
+# Start the server
 python3 pgp_webui.py
 # Opens https://localhost:8765
 ```
 
 > **HTTPS note:** The server uses a self-signed certificate. Your browser will show
 > "Not private" or "Unsafe" on first visit — this is normal. Click **Advanced →
-> Proceed to localhost (unsafe)**. The CA cert at `pgpvault-ca.crt` is what
-> mobile clients need to install as trusted.
+> Proceed to localhost (unsafe)**.
 
 ---
 
@@ -149,6 +148,30 @@ gpg --full-generate-key
 | `PGP_CLIPBOARD_CLEAR_SECONDS` | No | `30` | Auto-clear clipboard after N seconds |
 | `PGP_MAX_ATTEMPTS` | No | `5` | Failed decrypt attempts before lockout |
 | `SECRET_KEY` | No | random | Flask session secret |
+
+---
+
+## Multi-User Setup
+
+PGP Vault supports multiple users with per-user isolation:
+
+- **Per-user GPG homedir** — each user's private keys are isolated at `users/{username}/.gnupg/`
+- **Per-user message database** — each user has their own `users/{username}/messages.db`
+- **Per-user public keys** — each user's keyring is separate; importing a key = adding a contact
+- **Admin panel** — create/delete users, reset passwords, assign admin role
+- **Brute-force protection** — 5 failed login attempts per IP triggers a 15-minute lockout
+
+### Creating Users
+
+```bash
+# Create the first admin user
+python pgp_webui.py --init-admin admin yourpassword admin@example.com
+```
+
+After that, create additional users via the **Admin → Users** page in the web UI. Each new user automatically gets:
+- A GPG keypair (RSA-4096, no passphrase)
+- An isolated GPG homedir and message database
+- Other users' public keys auto-imported into their keyring
 
 ---
 
@@ -317,33 +340,28 @@ After 5 failed decrypt attempts (wrong key/passphrase), the UI locks for 5 minut
 
 ```
 echo-pgp-webui/
-├── pgp_webui.py          # Flask application — all routes, DB logic, and Jinja templates inline
-├── requirements-server.txt  # pip install -r requirements-server.txt
+├── pgp_webui.py              # Flask application — all routes, DB logic, and templates inline
+├── requirements-server.txt   # pip install -r requirements-server.txt
+├── tools/
+│   └── generate-cert.py      # Generate self-signed CA + server TLS certificates
 ├── README.md
 ├── LICENSE
-├── .gitignore
-│
-├── desktop/               # PyInstaller EXE build
-│   └── pgpvault.spec     # PyInstaller spec
-│
-├── pgp_mobile/           # Flet mobile/desktop client
-│   ├── main.py           # Flet app entry point
-│   └── lib/
-│       └── api_client.py  # httpx REST client for server API
-│
-├── tools/
-│   ├── build-exe.bat    # Build desktop EXE
-│   └── build-mobile.bat  # Build Flet mobile app
-│
-└── mobile_dist/          # Flet output (desktop EXE)
+└── .gitignore
 
-PGP_DIR/               # set via PGP_DIR env var (default: script's parent directory)
-├── messages.db        # SQLite — message metadata + encrypted payloads
-├── reply0.asc         # encrypted output files (reply{N}.asc, sequential)
-├── reply1.asc
-├── sent_log.json      # legacy log (updated on new sends for backwards compat)
-├── inbox/             # received .asc files (auto-scanned on first load)
-└── .tmp_*.asc         # temp files (cleaned up after decrypt/import)
+PGP_DIR/                      # set via PGP_DIR env var (default: script's parent directory)
+├── sessions.db               # SQLite — users, sessions, login attempts
+├── .auth_token               # Bearer token for API access
+├── pgpvault.crt              # TLS server certificate
+├── pgpvault.key              # TLS server private key
+├── pgpvault-ca.crt           # TLS CA certificate
+├── pgpvault-ca.key           # TLS CA private key
+└── users/
+    └── {username}/
+        ├── .gnupg/           # per-user GPG homedir (private keys isolated)
+        ├── messages.db       # per-user SQLite — message metadata + encrypted payloads
+        ├── pubkey.asc        # user's exported public key
+        ├── inbox/            # received .asc files
+        └── sent/             # sent .asc files
 ```
 
 ### SQLite Database Schema
@@ -354,13 +372,16 @@ The `messages.db` stores all message metadata and encrypted payloads:
 CREATE TABLE messages (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     timestamp       TEXT    NOT NULL,        -- ISO 8601, e.g. "2026-03-30T03:14:47"
-    sender          TEXT    NOT NULL,        -- your identity (PGP_SENDER_ID)
+    sender          TEXT    NOT NULL,        -- sender email/key ID
+    sender_username TEXT    DEFAULT '',
     recipient       TEXT    NOT NULL,        -- recipient email/key ID
     subject         TEXT    DEFAULT '',
     file_path       TEXT    DEFAULT '',      -- path to .asc file on disk
     content_hash    TEXT    NOT NULL,        -- SHA-256 of encrypted payload
     verified        INTEGER DEFAULT 0,       -- GPG signature verification
     encrypted_payload TEXT  NOT NULL,        -- full ASCII-armored PGP message
+    direction       TEXT    DEFAULT 'sent',  -- 'sent' or 'received'
+    read            INTEGER DEFAULT 0,       -- 0 = unread, 1 = read
     created_at      TEXT    DEFAULT (datetime('now'))
 );
 
@@ -432,9 +453,10 @@ curl "http://localhost:8765/api/messages?limit=20&offset=40"
     "id": 106,
     "timestamp": "2026-03-30T12:00:00",
     "sender": "you@yourdomain.com",
+    "sender_username": "alice",
     "recipient": "friend@example.com",
     "subject": "Hi",
-    "file_path": "D:/pgp/reply106.asc",
+    "file_path": "users/alice/sent/reply106.asc",
     "content_hash": "a1b2c3..."
   }
 ]
@@ -467,6 +489,16 @@ Delete a message from both SQLite DB AND the `.asc` file on disk.
 
 ```bash
 curl -X DELETE "http://localhost:8765/api/messages/106"
+```
+
+#### `PATCH /api/messages/<id>`
+
+Mark a message as read.
+
+```bash
+curl -X PATCH "http://localhost:8765/api/messages/106" \
+  -H "Content-Type: application/json" \
+  -d '{"read": true}'
 ```
 
 #### `POST /api/wipe`
@@ -532,20 +564,26 @@ key_id=ABC123DEF456
 
 | Route | Methods | Description |
 |-------|---------|-------------|
+| `/` | GET | Redirect to /compose |
+| `/login` | GET, POST | Login page |
+| `/logout` | POST | Logout and clear session |
 | `/compose` | GET, POST | Encrypt or decrypt messages |
 | `/inbox` | GET | View all messages (lazy decrypt — click to reveal) |
-| `/inbox/decrypt_file/<filename>` | GET | Decrypt a file inline (lazy decrypt) |
+| `/inbox/decrypt_file/<filename>` | GET | Decrypt a file inline (AJAX) |
 | `/inbox/raw/<filename>` | GET | Serve raw `.asc` file content |
-| `/inbox/delete_file/<filename>` | DELETE | Delete a disk-scanned `.asc` file (not tracked in DB) |
-| `/sent` | GET | View sent log |
-| `/sent/clear` | GET | Clear sent_log.json |
+| `/inbox/delete_file/<filename>` | DELETE | Delete a disk-scanned `.asc` file |
+| `/sent` | GET | View sent messages |
 | `/keys` | GET, POST | Key management — list, import, delete public keys |
-| `/keys/delete/<filename>` | DELETE | Delete a public key file from disk |
 | `/settings` | GET, POST | Settings — GPG homedir, confirmation guard, dark mode |
+| `/settings/ca-cert` | GET | Download CA certificate for client devices |
+| `/settings/regen-token` | POST | Regenerate API auth token |
 | `/settings/kill-agent` | GET | Kill gpg-agent, clear passphrase cache |
+| `/admin/users` | GET, POST | Admin — create, delete users, reset passwords |
+| `/admin/audit` | GET | Admin — view failed login attempts |
+| `/admin/unlock` | POST | Admin — unlock locked IPs/usernames |
 | `/toggle-dark` | POST | Toggle dark mode (cookie-based) |
 | `/api/messages` | GET, POST | REST API — list or create messages |
-| `/api/messages/<id>` | GET, DELETE | REST API — decrypt or delete single message |
+| `/api/messages/<id>` | GET, DELETE, PATCH | REST API — decrypt, delete, or mark-read |
 | `/api/wipe` | POST | Kill GPG agent, wipe DB, delete all `.asc` files |
 | `/health` | GET | Health check endpoint |
 
@@ -580,110 +618,18 @@ Or behind a reverse proxy (nginx/Caddy) with HTTPS.
 
 ---
 
-## Desktop EXE — PyInstaller
-
-A standalone Windows executable. No Python installation required.
-
-### Build It
-
-```batch
-git clone https://github.com/Echo-Computing/echo-pgp-webui
-cd echo-pgp-webui
-tools\build-exe.bat
-```
-Output: `desktop\dist\pgpvault\pgpvault.exe`
-
-The spec uses relative paths — any user can build from their own clone
-without editing the source. The CA cert (`pgpvault-ca.crt`) is bundled
-into the output directory so the server can serve it to mobile clients.
-
-### First Run
-
-1. Double-click `pgpvault.exe`
-2. Server starts at `https://localhost:8765`
-3. GPG is auto-detected from your system PATH / Git / GnuPG install
-4. On first launch a browser warning about unsafe cert is expected —
-   click **Advanced → Proceed to localhost (unsafe)**
-5. Data (DB, TLS certs, auth token) stored in `%LOCALAPPDATA%\pgp_vault`
-
-### GPG Detection
-
-The EXE looks for GPG in this order:
-1. Bundled `gpg/gpg.exe` (if you added one via `--add-data`)
-2. `gpg` or `gpg2` in your system PATH
-3. `C:\Program Files\Git\usr\bin\gpg.exe`
-4. `C:\Program Files (x86)\GnuPG\bin\gpg.exe`
-5. Prompts to install GnuPG from gpg4win.org
-
-### Build Manually
-
-```batch
-pip install flask flask-cors zeroconf pyinstaller
-python -m PyInstaller desktop\pgpvault.spec
-# Output: desktop\dist\pgpvault\pgpvault.exe
-```
-
----
-
-## Mobile App — Flet
-
-A Flet-based mobile/desktop client connects to the Flask server over HTTPS.
-
-### Build Desktop Client EXE
-
-```batch
-pip install flet httpx
-cd pgp_mobile
-flet pack main.py --add-data "..\pgpvault-ca.crt;." --add-data "lib;lib" --product-name "PGP Vault" --company-name "EchoVault" --distpath ..\mobile_dist -y
-# Output: mobile_dist\main.exe
-```
-
-The CA cert is bundled in so the client trusts your self-signed server cert automatically.
-
-### Build Android APK
-
-Requires **Flutter SDK** (install from [flutter.dev](https://flutter.dev)):
-
-```batch
-flutter doctor                        # check setup
-flutter config --enable-android      # enable Android toolchain
-flutter build apk --release          # outputs: build/app/outputs/flutter-apk/app-release.apk
-```
-
-### Connecting the Mobile App
-
-**Before connecting on Android:** install the CA cert as a trusted CA:
-
-1. Copy `pgpvault-ca.crt` from your desktop to your Android device
-2. Settings → Security → Encryption → Trusted credentials → Install from storage
-3. Select the `.crt` file
-
-Then connect:
-
-1. Start the desktop server (`pgpvault.exe` or `python pgp_webui.py`)
-2. On desktop: **Settings → Mobile API** — copy the `AUTH_TOKEN`
-3. In the mobile app: enter your server URL (e.g. `https://192.168.50.239:8765`) and the auth token
-4. The app connects over HTTPS — no "unsafe" warning if the CA cert is installed
-
-### Remote Access via VPN
-
-The mobile app works over LAN or a VPN tunnel — no port forwarding needed:
-
-- **WireGuard/OpenVPN**: connect your phone to the same VPN as the desktop
-- Use the VPN IP of your desktop (e.g. `https://10.0.0.2:8765`)
-- Install the CA cert on Android before connecting over VPN
-
----
-
 ## Security Considerations
 
 | Concern | Mitigation |
 |---------|-----------|
-| Mobile app sends auth token in cleartext over HTTPS | TLS encryption protects the token in transit |
-| Auth token stored on mobile device | Store in secure enclave / app-private storage |
-| CA cert installed on Android | Grants the app's traffic trust — only install from a server you control |
-| Secret keys on desktop only | Private keys never leave the desktop GPG keyring |
+| Auth token sent over HTTPS | TLS encryption protects the token in transit |
+| Auth token stored on client device | Store in secure enclave / app-private storage |
+| CA cert installed on client devices | Only install from a server you control |
+| Secret keys on server only | Private keys never leave the GPG keyring |
 | Message content in SQLite | Encrypted payload — ciphertext only, not plaintext |
+| Path traversal attacks | Usernames validated with regex, filenames stripped with `Path.name` |
+| SQL injection | All DB operations use parameterized queries |
+| Brute force login | 5 failed attempts per IP → 15-minute lockout |
 
 ---
 

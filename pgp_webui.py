@@ -2,7 +2,7 @@
 """
 PGP Web UI — standalone Flask interface for encrypt/decrypt operations.
 
-Echo Vault — echo@vault.local
+PGP Vault Web UI
 Run: python3 pgp_webui.py
 Opens: http://localhost:8765
 """
@@ -21,8 +21,11 @@ import secrets
 import ssl
 import socket
 import traceback
+import argparse
 from pathlib import Path
 from datetime import datetime
+from functools import wraps
+from werkzeug.security import generate_password_hash, check_password_hash
 
 # ── Paths (all configurable via env vars) ────────────────────────────────────
 # PGP_DIR: directory for keys, reply*.asc files, sent_log.json
@@ -39,10 +42,36 @@ _PGP_DIR_ENV = os.environ.get('PGP_DIR', _default_pgp_dir)
 PGP_DIR = Path(_PGP_DIR_ENV)
 DB_PATH = Path(os.environ.get('PGP_DB_PATH', str(PGP_DIR / 'messages.db')))
 
-# Sender identity — replace with your GPG key email before running
-SENDER_IDENTITY = os.environ.get('PGP_SENDER_ID', 'echo@vault.local')
+# ─── Multi-user configuration ────────────────────────────────────────────────
+USERS_DIR = PGP_DIR / 'users'
+SESSION_COOKIE = 'pgp_session'
+SESSION_EXPIRY_SECONDS = 86400 * 7   # 7 days
+BRUTEFORCE_WINDOW_SECS = 15 * 60     # 15 minutes
+BRUTEFORCE_MAX_ATTEMPTS = 5           # max failures per IP in window
+BRUTEFORCE_LOCKOUT_SECS = 15 * 60     # 15 minute lockout
+BRUTEFORCE_LOG = PGP_DIR / 'pgp_auth_attempts.log'
+DARK_MODE_COOKIE = 'dm'
 
-# ─── Auth token for mobile API clients ─────────────────────────────────────────
+# SENDER_IDENTITY is set per-user at send time via g.current_user['pgp_key_email'].
+# A module-level fallback is kept for legacy single-user mode only.
+SENDER_IDENTITY = os.environ.get('PGP_SENDER_ID', 'changeme@vault.local')
+
+_auth_logger = None
+def _get_auth_logger():
+    global _auth_logger
+    if _auth_logger is None:
+        _auth_logger = logging.getLogger('pgp_auth')
+        _auth_logger.setLevel(logging.INFO)
+        _auth_logger.propagate = False
+        handler = logging.FileHandler(str(BRUTEFORCE_LOG), encoding='utf-8')
+        handler.setFormatter(logging.Formatter('%(asctime)s %(levelname)s %(message)s'))
+        _auth_logger.addHandler(handler)
+    return _auth_logger
+
+# Thread-local for session and user DB connections
+_thread_local = threading.local()
+
+# ─── Auth token for API clients ───────────────────────────────────────
 _AUTH_TOKEN_FILE = PGP_DIR / '.auth_token'
 
 def _load_auth_token():
@@ -61,34 +90,6 @@ AUTH_TOKEN = os.environ.get('PGP_AUTH_TOKEN', _load_auth_token())
 CERT_PATH = PGP_DIR / 'pgpvault.crt'
 KEY_PATH = PGP_DIR / 'pgpvault.key'
 CA_CERT_PATH = PGP_DIR / 'pgpvault-ca.crt'
-
-# ─── Web UI Basic Auth ─────────────────────────────────────────────────────────
-_WEB_AUTH_FILE = PGP_DIR / '.web_auth'
-
-def _load_web_auth():
-    """Load web UI credentials from PGP_DIR/.web_auth if it exists."""
-    if not _WEB_AUTH_FILE.exists():
-        return '', ''
-    try:
-        content = _WEB_AUTH_FILE.read_text().strip()
-        if ':' in content:
-            user, pw_hash = content.split(':', 1)
-            return user.strip(), pw_hash.strip()
-    except Exception:
-        pass
-    return '', ''
-
-_WEB_AUTH_USER, _WEB_AUTH_PASS_HASH = _load_web_auth()
-
-def _save_web_auth(user: str, pw_hash: str):
-    """Persist web UI credentials to .web_auth file."""
-    try:
-        _WEB_AUTH_FILE.write_text(f'{user}:{pw_hash}')
-        return True
-    except Exception:
-        return False
-
-sys.path.insert(0, str(PGP_DIR))
 
 # Resolve gpg executable at startup — avoids FileNotFoundError on Windows where
 # Python subprocess doesn't always inherit the shell's PATH.
@@ -121,44 +122,252 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 app = Flask(__name__)
 app.config['PGP_DIR'] = PGP_DIR
-app.config['SENDER_IDENTITY'] = SENDER_IDENTITY
 app.config['DB_PATH'] = DB_PATH
 
-# Enable CORS for mobile API clients
+# Enable CORS for API clients
 CORS(app, resources={r"/api/*": {"origins": "*"}})
 
-# ─── Web UI Basic Auth ─────────────────────────────────────────────────────────
-# Credentials stored in PGP_DIR/.web_auth (user:hash) — not env vars.
-# Generate a password hash with:
-#   python -c "from werkzeug.security import generate_password_hash; print(generate_password_hash('yourpass'))"
+# ─── Session DB Infrastructure ─────────────────────────────────────────────────
+
+def _get_session_db() -> sqlite3.Connection:
+    """Get thread-local session DB connection (users + sessions + login_attempts)."""
+    if not hasattr(threading.current_thread(), '_session_db') or threading.current_thread()._session_db is None:
+        conn = sqlite3.connect(str(PGP_DIR / 'sessions.db'), timeout=30)
+        conn.row_factory = sqlite3.Row
+        conn.execute('PRAGMA journal_mode=WAL')
+        _init_session_db_schema(conn)
+        threading.current_thread()._session_db = conn
+    return threading.current_thread()._session_db
+
+
+def _init_session_db_schema(conn: sqlite3.Connection):
+    """Initialize session DB schema (users + sessions + login_attempts tables)."""
+    conn.execute('''
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT UNIQUE NOT NULL,
+            password_hash TEXT NOT NULL,
+            pgp_key_email TEXT NOT NULL,
+            created_at TEXT DEFAULT (datetime('now')),
+            is_admin INTEGER DEFAULT 0
+        )
+    ''')
+    conn.execute('''
+        CREATE TABLE IF NOT EXISTS sessions (
+            id TEXT PRIMARY KEY,
+            user_id INTEGER NOT NULL,
+            created_at TEXT DEFAULT (datetime('now')),
+            expires_at TEXT NOT NULL,
+            FOREIGN KEY (user_id) REFERENCES users(id)
+        )
+    ''')
+    conn.execute('CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id)')
+    conn.execute('CREATE INDEX IF NOT EXISTS idx_sessions_expires ON sessions(expires_at)')
+    conn.execute('''
+        CREATE TABLE IF NOT EXISTS login_attempts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ip_address TEXT NOT NULL,
+            username TEXT,
+            attempted_at TEXT DEFAULT (datetime('now')),
+            success INTEGER DEFAULT 0
+        )
+    ''')
+    conn.execute('CREATE INDEX IF NOT EXISTS idx_attempts_ip ON login_attempts(ip_address)')
+    conn.execute('CREATE INDEX IF NOT EXISTS idx_attempts_username ON login_attempts(username)')
+    conn.commit()
+
+
+def check_login_attempts(ip_address: str, username: str = None) -> tuple[bool, str]:
+    """
+    Check if IP or username is locked out due to too many failed attempts.
+    Returns (blocked, reason).
+    """
+    conn = _get_session_db()
+    cutoff = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
+
+    # Purge attempts older than 2 hours
+    conn.execute(
+        "DELETE FROM login_attempts WHERE attempted_at < datetime('now', '-2 hours')"
+    )
+    conn.commit()
+
+    # Check IP lockout: 5 failures in 15-minute window
+    ip_failures = conn.execute(
+        "SELECT COUNT(*) FROM login_attempts WHERE ip_address = ? AND success = 0 AND attempted_at > datetime('now', '-15 minutes')",
+        (ip_address,)
+    ).fetchone()[0]
+    if ip_failures >= BRUTEFORCE_MAX_ATTEMPTS:
+        return True, f'IP locked due to {ip_failures} failed attempts. Try again in 15 minutes.'
+
+    # Check username lockout: 3 failures in 15-minute window
+    if username:
+        user_failures = conn.execute(
+            "SELECT COUNT(*) FROM login_attempts WHERE username = ? AND success = 0 AND attempted_at > datetime('now', '-15 minutes')",
+            (username,)
+        ).fetchone()[0]
+        if user_failures >= 3:
+            return True, f'Account locked due to {user_failures} failed attempts. Contact admin to unlock.'
+
+    return False, ''
+
+
+def record_failed_attempt(ip_address: str, username: str = None):
+    """Record a failed login attempt."""
+    conn = _get_session_db()
+    conn.execute(
+        "INSERT INTO login_attempts (ip_address, username, success) VALUES (?, ?, 0)",
+        (ip_address, username)
+    )
+    conn.commit()
+    auth_log = _get_auth_logger()
+    auth_log.warning('LOGIN FAILED ip=%s user=%s', ip_address, username or 'unknown')
+
+
+def clear_failed_attempts(ip_address: str, username: str = None):
+    """Clear failed attempts on successful login."""
+    conn = _get_session_db()
+    if username:
+        conn.execute(
+            "DELETE FROM login_attempts WHERE ip_address = ? AND username = ?",
+            (ip_address, username)
+        )
+    else:
+        conn.execute(
+            "DELETE FROM login_attempts WHERE ip_address = ?",
+            (ip_address,)
+        )
+    conn.commit()
+
+
+def admin_clear_lockout(ip_address: str = None, username: str = None) -> int:
+    """Admin: clear lockout for a specific IP or username. Returns rowcount."""
+    conn = _get_session_db()
+    if ip_address:
+        result = conn.execute(
+            "DELETE FROM login_attempts WHERE ip_address = ? AND success = 0",
+            (ip_address,)
+        )
+    elif username:
+        result = conn.execute(
+            "DELETE FROM login_attempts WHERE username = ? AND success = 0",
+            (username,)
+        )
+    else:
+        return 0
+    conn.commit()
+    return result.rowcount
+
+
+def create_session(user_id: int) -> str:
+    """Create a new session for a user. Returns session ID."""
+    session_id = secrets.token_hex(32)
+    expires_at = datetime.fromtimestamp(
+        datetime.utcnow().timestamp() + SESSION_EXPIRY_SECONDS
+    ).strftime('%Y-%m-%d %H:%M:%S')
+    conn = _get_session_db()
+    conn.execute(
+        "INSERT INTO sessions (id, user_id, expires_at) VALUES (?, ?, ?)",
+        (session_id, user_id, expires_at)
+    )
+    conn.commit()
+    return session_id
+
+
+def get_session_user(session_id: str) -> dict:
+    """Look up a session and return the user dict if valid and not expired."""
+    conn = _get_session_db()
+    now = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
+    row = conn.execute('''
+        SELECT u.id, u.username, u.pgp_key_email, u.is_admin, u.created_at,
+               s.created_at as session_created, s.expires_at
+        FROM sessions s
+        JOIN users u ON u.id = s.user_id
+        WHERE s.id = ? AND s.expires_at > ?
+    ''', (session_id, now)).fetchone()
+    if not row:
+        return None
+    return dict(row)
+
+
+def delete_session(session_id: str):
+    """Delete a session (logout)."""
+    conn = _get_session_db()
+    conn.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
+    conn.commit()
+
+
+def admin_required(f):
+    """Decorator requiring a valid admin session."""
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        from flask import g, redirect
+        if not hasattr(g, 'current_user') or not g.current_user:
+            return redirect(url_for('login_page'))
+        if g.current_user.get('is_admin') != 1:
+            return redirect(url_for('login_page'))
+        return f(*args, **kwargs)
+    return decorated
+
 
 @app.before_request
-def require_basic_auth():
-    """Protect all non-API routes with HTTP Basic Auth if credentials are configured."""
-    from flask import request, make_response, g
-    # Track current user for header display
+def auth_middleware():
+    """Authenticate user via session cookie, skip for public routes."""
+    from flask import g, redirect
     g.current_user = None
-    # Skip auth for /api/* (Bearer token), /health, and static assets
-    if request.path.startswith('/api/') or request.path in ('/health', '/favicon.ico'):
+    # Public routes — no auth required
+    if request.path in ('/health', '/favicon.ico', '/login'):
         return
-    # Skip auth for inbox AJAX sub-routes — these are called by JS on the same
-    # origin; browser will send credentials automatically if cached
-    if request.path.startswith(('/inbox/decrypt_file/', '/inbox/raw/', '/inbox/delete_file/')):
+    if request.method == 'OPTIONS':
         return
-    # Reload credentials from file so Settings changes take effect immediately
-    _user, _pw_hash = _load_web_auth()
-    if not _user or not _pw_hash:
-        return  # Auth disabled — no password set yet, open access
-    from werkzeug.security import check_password_hash
-    auth = request.authorization
-    if not auth or auth.username != _user or not check_password_hash(_pw_hash, auth.password):
-        realm = "PGP Vault"
-        return make_response(
-            f'<h1>401 Unauthorized</h1><p>Set a web UI password in Settings to protect access.</p>',
-            401,
-            {'WWW-Authenticate': f'Basic realm="{realm}"'}
-        )
-    g.current_user = _user
+    # API paths: Bearer token auth
+    if request.path.startswith('/api/'):
+        auth = request.headers.get('Authorization', '')
+        if auth.startswith('Bearer '):
+            token = auth[7:]
+            if token == AUTH_TOKEN:
+                # API access with valid token — set a minimal g.current_user
+                g.current_user = {'username': 'api', 'pgp_key_email': 'api', 'is_admin': 0}
+        return
+    # All other routes: session cookie required
+    session_id = request.cookies.get(SESSION_COOKIE)
+    if session_id:
+        user = get_session_user(session_id)
+        if user:
+            g.current_user = user
+            return
+    # No valid session — redirect to login
+    if request.path.startswith('/admin/'):
+        from flask import make_response
+        return make_response(redirect(url_for('login_page')))
+    if not request.path.startswith('/static'):
+        return redirect(url_for('login_page'))
+
+
+def get_user_db(username: str = None) -> sqlite3.Connection:
+    """
+    Get a user's personal messages.db connection.
+    Uses current user if username is None.
+    Per-user DB lives at users/{username}/messages.db
+    """
+    import html
+    if username is None:
+        from flask import g
+        if hasattr(g, 'current_user') and g.current_user:
+            username = g.current_user['username']
+        else:
+            raise ValueError('No username and no current user in request context')
+    # Validate username to prevent path traversal
+    if not re.match(r'^[a-zA-Z0-9_.-]{1,64}$', username):
+        raise ValueError(f'Invalid username: {username}')
+    user_dir = USERS_DIR / username
+    user_dir.mkdir(parents=True, exist_ok=True)
+    user_db = user_dir / 'messages.db'
+    conn = sqlite3.connect(str(user_db), timeout=30)
+    conn.row_factory = sqlite3.Row
+    conn.execute('PRAGMA journal_mode=WAL')
+    _init_db_schema(conn)
+    return conn
+
 
 # Global error handler — log unhandled exceptions but let Flask handle HTTP errors normally
 @app.errorhandler(Exception)
@@ -169,16 +378,397 @@ def handle_exception(e):
     logger.exception("Unhandled exception: %s", e)
     return f"<h1>Internal Server Error</h1><pre>{traceback.format_exc()}</pre>", 500
 
-# ─── API auth guard ────────────────────────────────────────────────────────────
-@app.before_request
-def _check_api_auth():
-    if request.path.startswith('/api/') and request.method != 'OPTIONS':
-        auth = request.headers.get('Authorization', '')
-        if not auth.startswith('Bearer '):
-            return jsonify({'error': 'Missing or invalid Authorization header'}), 401
-        token = auth[7:]
-        if token != AUTH_TOKEN:
-            return jsonify({'error': 'Invalid token'}), 403
+# ─── Login / Logout ─────────────────────────────────────────────────────────────
+
+def _get_login_form(error=''):
+    """Render the login form HTML."""
+    error_html = f'<div class="alert error">{error}</div>' if error else ''
+    return f'''
+    <!doctype html>
+    <html>
+    <head>
+      <meta charset="utf-8">
+      <title>Login — PGP Vault</title>
+      <style>
+        body {{ background: #0d1117; color: #e6edf3; font-family: -apple-system, BlinkMacSystemFont, sans-serif; display: flex; align-items: center; justify-content: center; min-height: 100vh; margin: 0; }}
+        .login-box {{ background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 2rem; width: 360px; box-shadow: 0 8px 32px rgba(0,0,0,0.4); }}
+        h1 {{ color: #58a6ff; font-size: 1.2rem; margin-bottom: 1.5rem; text-align: center; }}
+        label {{ display: block; color: #8b949e; font-size: 0.85rem; margin-bottom: 0.3rem; }}
+        input {{ width: 100%; background: #0d1117; border: 1px solid #30363d; border-radius: 6px; color: #e6edf3; padding: 0.6rem; font-size: 0.9rem; box-sizing: border-box; margin-bottom: 1rem; }}
+        input:focus {{ outline: none; border-color: #58a6ff; }}
+        button {{ width: 100%; background: #238636; border: none; border-radius: 6px; color: #fff; padding: 0.7rem; font-size: 0.9rem; cursor: pointer; font-weight: 500; }}
+        button:hover {{ background: #2ea043; }}
+        .error {{ background: #2d1117; border: 1px solid #f85149; color: #f85149; border-radius: 6px; padding: 0.8rem; margin-bottom: 1rem; font-size: 0.85rem; }}
+        p {{ color: #8b949e; font-size: 0.8rem; text-align: center; margin-top: 1rem; }}
+      </style>
+    </head>
+    <body>
+    <div class="login-box">
+      <h1>🔐 PGP Vault</h1>
+      {error_html}
+      <form method="post">
+        <label for="username">Username</label>
+        <input type="text" name="username" id="username" autocomplete="username" autofocus required>
+        <label for="password">Password</label>
+        <input type="password" name="password" id="password" autocomplete="current-password" required>
+        <button type="submit">Sign In</button>
+      </form>
+      <p>Ask your admin to create an account.</p>
+    </div>
+    </body>
+    </html>'''
+
+
+@app.route('/login', methods=['GET', 'POST'])
+def login_page():
+    """Login page with session-based authentication."""
+    if request.method == 'GET':
+        return _get_login_form(), 200
+
+    ip_address = request.remote_addr or '127.0.0.1'
+    username = (request.form.get('username') or '').strip()
+    password = request.form.get('password', '')
+
+    # Check brute-force lockout first
+    blocked, block_reason = check_login_attempts(ip_address, username)
+    if blocked:
+        return _get_login_form(f'Account locked: {block_reason}'), 429
+
+    # Look up user
+    conn = _get_session_db()
+    user_row = conn.execute(
+        'SELECT * FROM users WHERE username = ?', (username,)
+    ).fetchone()
+
+    if user_row and check_password_hash(user_row['password_hash'], password):
+        # Successful login
+        clear_failed_attempts(ip_address, username)
+        record_failed_attempt(ip_address, username)  # log success
+        session_id = create_session(user_row['id'])
+        resp = app.make_response(redirect(url_for('compose')))
+        resp.set_cookie(SESSION_COOKIE, session_id, max_age=SESSION_EXPIRY_SECONDS,
+                        httponly=True, samesite='Lax')
+        return resp
+    else:
+        # Failed login
+        record_failed_attempt(ip_address, username)
+        # Refresh lockout check after recording
+        blocked, block_reason = check_login_attempts(ip_address, username)
+        if blocked:
+            return _get_login_form(f'Login failed. {block_reason}'), 429
+        return _get_login_form('Invalid username or password'), 200
+
+
+@app.route('/logout', methods=['POST'])
+def logout():
+    """Clear session cookie and redirect to login."""
+    session_id = request.cookies.get(SESSION_COOKIE)
+    if session_id:
+        delete_session(session_id)
+    resp = app.make_response(redirect(url_for('login_page')))
+    resp.set_cookie(SESSION_COOKIE, '', expires=0)
+    return resp
+
+
+# ─── Admin Routes ───────────────────────────────────────────────────────────────
+
+@app.route('/admin/audit', methods=['GET'])
+@admin_required
+def admin_audit():
+    """Show failed login attempts log."""
+    import html
+    dark = request.cookies.get(DARK_MODE_COOKIE, '1') == '1'
+    conn = _get_session_db()
+    now = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
+
+    # Failed attempts in last 24h
+    recent = conn.execute('''
+        SELECT ip_address, username, attempted_at, success
+        FROM login_attempts
+        WHERE attempted_at > datetime('now', '-24 hours')
+        ORDER BY attempted_at DESC
+        LIMIT 200
+    ''').fetchall()
+
+    # Currently locked IPs (5+ failures in 15-min window)
+    locked_ips = conn.execute('''
+        SELECT ip_address, COUNT(*) as c FROM login_attempts
+        WHERE success = 0 AND attempted_at > datetime('now', '-15 minutes')
+        GROUP BY ip_address HAVING c >= ?
+    ''', (BRUTEFORCE_MAX_ATTEMPTS,)).fetchall()
+
+    # Currently locked usernames
+    locked_users = conn.execute('''
+        SELECT username, COUNT(*) as c FROM login_attempts
+        WHERE success = 0 AND attempted_at > datetime('now', '-15 minutes') AND username IS NOT NULL
+        GROUP BY username HAVING c >= 3
+    ''').fetchall()
+
+    rows_html = ''
+    for r in recent:
+        status = '✅' if r['success'] else '❌'
+        rows_html += f'''<tr>
+          <td>{html.escape(r['ip_address'])}</td>
+          <td>{html.escape(r['username'] or '—')}</td>
+          <td>{r['attempted_at']}</td>
+          <td>{status}</td>
+        </tr>'''
+
+    locked_ips_html = ''
+    for r in locked_ips:
+        locked_ips_html += f'''<tr><td>{html.escape(r['ip_address'])}</td><td>{r['c']} failures</td><td>
+        <form method="post" action="{url_for('admin_unlock')}">
+          <input type="hidden" name="ip_address" value="{html.escape(r['ip_address'])}">
+          <button type="submit" class="btn small danger">Unlock</button>
+        </form></td></tr>'''
+
+    locked_users_html = ''
+    for r in locked_users:
+        locked_users_html += f'''<tr><td>{html.escape(r['username'])}</td><td>{r['c']} failures</td><td>
+        <form method="post" action="{url_for('admin_unlock')}">
+          <input type="hidden" name="username" value="{html.escape(r['username'])}">
+          <button type="submit" class="btn small danger">Unlock</button>
+        </form></td></tr>'''
+
+    body = f'''
+    <div class="alert info">Failed login attempts in the last 24 hours.</div>
+    <div class="card">
+    <h2>Locked Out</h2>
+    <table><thead><tr><th>IP / Username</th><th>Failures</th><th>Action</th></tr></thead>
+    <tbody>
+    {locked_ips_html}{locked_users_html}
+    </tbody></table>
+    {"<p style='color:#8b949e;padding:1rem'>No accounts currently locked.</p>" if not locked_ips and not locked_users else ""}
+    </div>
+    <div class="card">
+    <h2>Recent Attempts</h2>
+    <table><thead><tr><th>IP</th><th>Username</th><th>Time</th><th>Result</th></tr></thead>
+    <tbody>{rows_html}</tbody></table>
+    {"<p style='color:#8b949e;padding:1rem'>No attempts in the last 24 hours.</p>" if not recent else ""}
+    </div>'''
+    return render('Login Audit', 'admin_audit', body, dark)
+
+
+@app.route('/admin/unlock', methods=['POST'])
+@admin_required
+def admin_unlock():
+    """Admin: clear a lockout by IP or username."""
+    ip_address = request.form.get('ip_address', '').strip()
+    username = request.form.get('username', '').strip()
+    count = admin_clear_lockout(ip_address=ip_address or None, username=username or None)
+    resp = app.make_response(redirect(url_for('admin_audit')))
+    if count > 0:
+        resp.set_cookie('flash', f'Unlocked {count} record(s)', max_age=30)
+    return resp
+
+
+@app.route('/admin/users', methods=['GET', 'POST'])
+@admin_required
+def admin_users():
+    """Admin: create, list, and delete user accounts."""
+    import html
+    dark = request.cookies.get(DARK_MODE_COOKIE, '1') == '1'
+    msg = request.cookies.get('flash', '')
+
+    conn = _get_session_db()
+    user_rows = conn.execute('SELECT id, username, pgp_key_email, is_admin, created_at FROM users ORDER BY created_at').fetchall()
+
+    if request.method == 'POST':
+        action = request.form.get('action', '')
+        if action == 'create':
+            username = (request.form.get('username') or '').strip()
+            password = request.form.get('password', '')
+            password2 = request.form.get('password2', '')
+            pgp_email = (request.form.get('pgp_email') or '').strip()
+            is_admin = 1 if request.form.get('is_admin') else 0
+
+            if not username or not password or not pgp_email:
+                msg = '<div class="alert error">All fields are required.</div>'
+            elif password != password2:
+                msg = '<div class="alert error">Passwords do not match.</div>'
+            elif not re.match(r'^[a-zA-Z0-9_.-]{1,64}$', username):
+                msg = '<div class="alert error">Username may only contain letters, numbers, dots, dashes, and underscores (max 64 chars).</div>'
+            elif not re.match(r'^[^<>:@/\\]+@[^<>:@/\\]+$', pgp_email):
+                msg = '<div class="alert error">Invalid email address.</div>'
+            else:
+                existing = conn.execute('SELECT id FROM users WHERE username = ?', (username,)).fetchone()
+                if existing:
+                    msg = '<div class="alert error">Username already exists.</div>'
+                else:
+                    pw_hash = generate_password_hash(password)
+                    conn.execute(
+                        'INSERT INTO users (username, password_hash, pgp_key_email, is_admin) VALUES (?, ?, ?, ?)',
+                        (username, pw_hash, pgp_email, is_admin)
+                    )
+                    conn.commit()
+                    # Create user directory
+                    user_dir = USERS_DIR / username
+                    user_dir.mkdir(parents=True, exist_ok=True)
+                    # Generate GPG keypair for user
+                    try:
+                        _generate_gpg_key(username, pgp_email)
+                        # Auto-import all existing users' pubkeys into new user's keyring so they can
+                        # message any existing user immediately (contact discovery bootstrap).
+                        for dirent in os.listdir(USERS_DIR):
+                            if dirent == username:
+                                continue
+                            existing_pubkey = USERS_DIR / dirent / 'pubkey.asc'
+                            if existing_pubkey.exists():
+                                run_gpg_user(['--import', str(existing_pubkey)], username)
+                        msg = f'<div class="alert success">User {html.escape(username)} created with GPG key.</div>'
+                    except Exception as e:
+                        msg = f'<div class="alert info">User {html.escape(username)} created but key generation failed: {html.escape(str(e))}. Create their GPG key manually.</div>'
+                    user_rows = conn.execute('SELECT id, username, pgp_key_email, is_admin, created_at FROM users ORDER BY created_at').fetchall()
+
+        elif action == 'delete':
+            username = (request.form.get('username') or '').strip()
+            if username == 'admin':
+                msg = '<div class="alert error">Cannot delete the admin account.</div>'
+            elif not re.match(r'^[a-zA-Z0-9_.-]{1,64}$', username):
+                msg = '<div class="alert error">Invalid username.</div>'
+            else:
+                user_row = conn.execute('SELECT id FROM users WHERE username = ?', (username,)).fetchone()
+                if user_row:
+                    # Delete sessions first
+                    conn.execute('DELETE FROM sessions WHERE user_id = ?', (user_row['id'],))
+                    conn.execute('DELETE FROM users WHERE username = ?', (username,))
+                    conn.commit()
+                    # Remove user directory
+                    user_dir = USERS_DIR / username
+                    if user_dir.exists():
+                        shutil.rmtree(user_dir)
+                    msg = f'<div class="alert success">User {html.escape(username)} deleted.</div>'
+                    user_rows = conn.execute('SELECT id, username, pgp_key_email, is_admin, created_at FROM users ORDER BY created_at').fetchall()
+
+        elif action == 'reset_password':
+            user_id = (request.form.get('user_id') or '').strip()
+            new_password = request.form.get('new_password', '')
+            new_password2 = request.form.get('new_password2', '')
+            if not new_password or new_password != new_password2:
+                msg = '<div class="alert error">Passwords do not match or are empty.</div>'
+            elif user_id.isdigit():
+                pw_hash = generate_password_hash(new_password)
+                conn.execute('UPDATE users SET password_hash = ? WHERE id = ?', (pw_hash, int(user_id)))
+                conn.commit()
+                msg = '<div class="alert success">Password reset.</div>'
+
+    user_rows_html = ''
+    for u in user_rows:
+        admin_badge = ' <span style="color:#d29922;font-size:0.75rem">[admin]</span>' if u['is_admin'] else ''
+        user_rows_html += f'''<tr>
+          <td>{html.escape(u['username'])}{admin_badge}</td>
+          <td><code>{html.escape(u['pgp_key_email'])}</code></td>
+          <td>{u['created_at'][:16]}</td>
+          <td>
+            <form method="post" style="display:inline">
+              <input type="hidden" name="action" value="delete">
+              <input type="hidden" name="username" value="{html.escape(u['username'])}">
+              <button type="submit" class="btn small danger" onclick="return confirm('Delete user {html.escape(u["username"])}? This deletes all their messages.')">Delete</button>
+            </form>
+            <form method="post" style="display:inline">
+              <input type="hidden" name="action" value="reset_password">
+              <input type="hidden" name="user_id" value="{u['id']}">
+              <input type="password" name="new_password" placeholder="New password" style="width:120px;margin-bottom:0">
+              <input type="password" name="new_password2" placeholder="Confirm" style="width:120px;margin-bottom:0">
+              <button type="submit" class="btn small">Reset</button>
+            </form>
+          </td>
+        </tr>'''
+
+    body = f'''
+    {msg}
+    <div class="card">
+    <h2>User Accounts</h2>
+    <table><thead><tr><th>Username</th><th>PGP Email</th><th>Created</th><th>Actions</th></tr></thead>
+    <tbody>{user_rows_html}</tbody></table>
+    </div>
+    <div class="card">
+    <h2>Create User</h2>
+    <form method="post">
+      <input type="hidden" name="action" value="create">
+      <div class="form-row">
+        <label for="username">Username</label>
+        <input type="text" name="username" id="username" placeholder="alice" autocomplete="username" required pattern="[a-zA-Z0-9_.-]+">
+      </div>
+      <div class="form-row">
+        <label for="pgp_email">PGP Email</label>
+        <input type="email" name="pgp_email" id="pgp_email" placeholder="alice@vault.local" required>
+      </div>
+      <div class="form-row">
+        <label for="password">Password</label>
+        <input type="password" name="password" id="password" autocomplete="new-password" required>
+      </div>
+      <div class="form-row">
+        <label for="password2">Confirm Password</label>
+        <input type="password" name="password2" id="password2" autocomplete="new-password" required>
+      </div>
+      <div class="form-row">
+        <label>
+          <input type="checkbox" name="is_admin" value="1"> Make this user an admin
+        </label>
+      </div>
+      <button type="submit" class="btn primary">Create User</button>
+    </form>
+    </div>'''
+    return render('User Management', 'admin_users', body, dark)
+
+
+def _generate_gpg_key(username: str, email: str):
+    """Generate an RSA-4096 GPG keypair for a user in their personal homedir."""
+    # Validate inputs to prevent GPG batch injection
+    if not re.match(r'^[a-zA-Z0-9_.-]{1,64}$', username):
+        raise ValueError(f'Invalid username: {username}')
+    if not re.match(r'^[^<>:@/\\]+@[^<>:@/\\]+$', email):
+        raise ValueError(f'Invalid email address: {email}')
+
+    user_dir = USERS_DIR / username
+    user_dir.mkdir(parents=True, exist_ok=True)
+    gpg_home = user_dir / '.gnupg'
+    gpg_home.mkdir(exist_ok=True)
+
+    batch = (
+        f'%no-protection\n'
+        f'Key-Type: RSA\n'
+        f'Key-Length: 4096\n'
+        f'Subkey-Type: RSA\n'
+        f'Subkey-Length: 4096\n'
+        f'Name-Real: {username}\n'
+        f'Name-Email: {email}\n'
+        f'Expire-Date: 0\n'
+        f'%commit\n'
+    ).encode()
+
+    tmp = PGP_DIR / (f'.keygen_{secrets.token_hex(8)}.batch')
+    tmp.write_bytes(batch)
+    try:
+        # Generate key in user's personal homedir
+        run_gpg(['--batch', '--gen-key', '--homedir', str(gpg_home), str(tmp)],
+                input_text=None, input_file=None)
+        # Export public key to users/{username}/pubkey.asc
+        pub_out, err, code = run_gpg(
+            ['--homedir', str(gpg_home), '--armor', '--export', email],
+            input_text=None, input_file=None
+        )
+        if code == 0 and pub_out:
+            (user_dir / 'pubkey.asc').write_text(pub_out)
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+def _init_admin_user(username: str, password: str, pgp_email: str):
+    """Create the first admin user. Called via --init-admin CLI flag."""
+    pw_hash = generate_password_hash(password)
+    conn = _get_session_db()
+    conn.execute(
+        'INSERT INTO users (username, password_hash, pgp_key_email, is_admin) VALUES (?, ?, ?, 1)',
+        (username, pw_hash, pgp_email)
+    )
+    conn.commit()
+    user_dir = USERS_DIR / username
+    user_dir.mkdir(parents=True, exist_ok=True)
+    _generate_gpg_key(username, pgp_email)
+
+
 # ─── SQLite Storage ──────────────────────────────────────────────────────────
 
 def get_db() -> sqlite3.Connection:
@@ -190,6 +780,10 @@ def get_db() -> sqlite3.Connection:
         _init_db_schema(conn)
         threading.current_thread()._db = conn
     return threading.current_thread()._db
+
+
+
+
 
 def _init_db_schema(conn: sqlite3.Connection):
     """Initialize DB schema if not exists."""
@@ -224,11 +818,15 @@ def _init_db_schema(conn: sqlite3.Connection):
         conn.execute("ALTER TABLE messages ADD COLUMN read INTEGER DEFAULT 0")
     except Exception:
         pass  # column already exists
+    # Add sender_username column for multi-user (per-user inbox filtering)
+    try:
+        conn.execute("ALTER TABLE messages ADD COLUMN sender_username TEXT DEFAULT ''")
+    except Exception:
+        pass  # column already exists
     conn.execute('CREATE INDEX IF NOT EXISTS idx_direction ON messages(direction)')
     # Backfill direction for existing entries that don't have it
     try:
-        conn.execute("UPDATE messages SET direction='sent' WHERE direction='unknown' AND sender=?",
-                     (SENDER_IDENTITY,))
+        conn.execute("UPDATE messages SET direction='sent' WHERE direction='unknown'")
     except Exception:
         pass
     conn.commit()
@@ -239,8 +837,9 @@ def _import_sent_log() -> int:
     sent_log = PGP_DIR / 'sent_log.json'
     if not sent_log.exists():
         return 0
-    # Check if already imported
-    row = conn.execute("SELECT COUNT(*) as c FROM messages WHERE file_path LIKE 'D:/pgp/reply%'").fetchone()
+    # Check if already imported (look for any existing rows with a file_path)
+    row = conn.execute("SELECT COUNT(*) as c FROM messages WHERE file_path LIKE ?",
+                     (str(PGP_DIR / 'reply%'),)).fetchone()
     if row['c'] > 0:
         return 0  # Already imported
 
@@ -257,8 +856,8 @@ def _import_sent_log() -> int:
                 INSERT OR IGNORE INTO messages
                     (timestamp, sender, recipient, subject, file_path, content_hash, encrypted_payload, direction)
                 VALUES (?, ?, ?, ?, ?, ?, ?, 'sent')
-            ''', (e.get('timestamp', ''), SENDER_IDENTITY, e.get('recipient', ''),
-                  '', str(fp), h, content))
+            ''', (e.get('timestamp', ''), e.get('recipient', ''),
+                  e.get('subject', ''), str(fp), h, content))
             count += 1
         conn.commit()
         print(f"[*] Imported {count} entries from sent_log.json")
@@ -268,9 +867,6 @@ def _import_sent_log() -> int:
 
 # ─── Dark mode toggle via cookie ───────────────────────────────────────────────
 
-DARK_MODE_COOKIE = 'dark_mode'
-DEFAULT_DARK = True
-
 @app.context_processor
 def inject_dark_mode():
     dark = request.cookies.get(DARK_MODE_COOKIE, '1') == '1'
@@ -278,13 +874,17 @@ def inject_dark_mode():
 
 # ─── GPG Passthrough ────────────────────────────────────────────────────────────
 
-def run_gpg(args, input_text=None, input_file=None, decode=True):
+def run_gpg(args, input_text=None, input_file=None, decode=True, homedir=None):
     kwargs = {'capture_output': True}
     if input_text:
         kwargs['input'] = input_text.encode('utf-8')
     if input_file:
         kwargs['input'] = Path(input_file).read_bytes()
-    result = subprocess.run([GPG_BIN] + args, **kwargs)
+    full_args = [GPG_BIN]
+    if homedir:
+        full_args.extend(['--homedir', str(homedir)])
+    full_args.extend(args)
+    result = subprocess.run(full_args, **kwargs)
     if decode:
         stdout = result.stdout.decode('utf-8', errors='replace')
         stderr = result.stderr.decode('utf-8', errors='replace')
@@ -292,55 +892,20 @@ def run_gpg(args, input_text=None, input_file=None, decode=True):
         stdout, stderr = result.stdout, result.stderr
     return stdout, stderr, result.returncode
 
-def decrypt_text(ciphertext, local_user=None):
-    ciphertext = ciphertext.strip()
-    while ciphertext.startswith('\n'):
-        ciphertext = ciphertext.lstrip('\n')
-    if not ciphertext.startswith('-----BEGIN'):
-        ciphertext = '-----BEGIN PGP MESSAGE-----\n\n' + ciphertext
-    tmp = app.config['PGP_DIR'] / f'.tmp_dec_{int(time.time())}.asc'
-    tmp.write_text(ciphertext)
-    try:
-        args = ['--decrypt', '--output', '-', str(tmp)]
-        if local_user:
-            args.insert(1, '--local-user')
-            args.insert(2, local_user)
-        out, err, code = run_gpg(args, decode=True)
-        return out, err, code
-    finally:
-        tmp.unlink(missing_ok=True)
-
-def encrypt_message(recipient, plaintext, armor=True, output=None):
-    args = ['--batch', '--yes', '--encrypt', '--always-trust']
-    if armor:
-        args.append('--armor')
-    args += ['--recipient', recipient, '--local-user', app.config['SENDER_IDENTITY']]
-    kwargs = {'capture_output': True, 'encoding': 'utf-8', 'input': plaintext}
-    result = subprocess.run([GPG_BIN] + args, **kwargs)
-    if result.returncode == 0 and output:
-        Path(output).write_text(result.stdout)
-    return result.stdout, result.stderr, result.returncode
-
-def list_public_keys():
-    out, err, code = run_gpg(['--keyid-format=long', '--fixed-list-mode', '--list-keys'])
+def list_public_keys(username):
+    out, err, code = run_gpg_user(['--keyid-format=long', '--fixed-list-mode', '--list-keys'], username)
     return out
 
-def list_secret_keys():
-    out, err, code = run_gpg(['--keyid-format=long', '--list-secret-keys'])
-    return out
-
-def import_public_key(key_data: str) -> tuple[str, str, int]:
-    """Import a public key block. Returns (stdout, stderr, returncode)."""
-    # Normalize: remove only trailing \r\n, preserve leading whitespace and armor structure
+def import_public_key(key_data: str, username: str) -> tuple[str, str, int]:
+    """Import a public key into user's keyring. Returns (stdout, stderr, returncode)."""
     key_data = key_data.rstrip('\r\n')
-    # Ensure blank line before armor header (some paste jobs lose it)
     armor = key_data.lstrip()
     leading = key_data[:len(key_data) - len(armor)]
     if armor.startswith('-----BEGIN') and not leading.endswith('\n\n'):
         key_data = '\n' + key_data
     tmp = app.config['PGP_DIR'] / f'.tmp_import_{int(time.time())}.asc'
     tmp.write_text(key_data)
-    out, err, code = run_gpg(['--import', str(tmp)])
+    out, err, code = run_gpg_user(['--import', str(tmp)], username)
     try:
         tmp.unlink()
     except Exception:
@@ -350,6 +915,128 @@ def import_public_key(key_data: str) -> tuple[str, str, int]:
 def gpg_agent_status():
     out, err, code = run_gpg(['--list-keys'])
     return 'running' if code == 0 else 'stopped'
+
+
+def run_gpg_user(args, username, input_text=None, input_file=None, decode=True):
+    """Run GPG with the given user's personal homedir."""
+    user_homedir = USERS_DIR / username / '.gnupg'
+    return run_gpg(args, input_text=input_text, input_file=input_file,
+                   decode=decode, homedir=user_homedir)
+
+
+def encrypt_to_recipient(recipient_email, plaintext, sender_username, armor=True):
+    """
+    Encrypt plaintext to recipient_email using recipient's public key.
+    Server encrypts on behalf of sender — server never stores plaintext.
+    Uses sender_username's GPG homedir for signing.
+
+    Returns (stdout, stderr, returncode).
+    """
+    # Find recipient's public key file by scanning users/*/pubkey.asc
+    recipient_pubkey_path = None
+    try:
+        for dirent in os.listdir(USERS_DIR):
+            pubkey = USERS_DIR / dirent / 'pubkey.asc'
+            if pubkey.exists():
+                content = pubkey.read_text()
+                if recipient_email in content:
+                    recipient_pubkey_path = pubkey
+                    break
+    except OSError:
+        pass
+
+    if not recipient_pubkey_path:
+        return '', f'Recipient public key not found: {recipient_email}', 1
+
+    # Import recipient's pubkey into sender's homedir for encryption
+    run_gpg_user(['--import', str(recipient_pubkey_path)], sender_username)
+
+    args = ['--batch', '--yes', '--encrypt', '--always-trust']
+    if armor:
+        args.append('--armor')
+    args += ['--recipient', recipient_email, '--local-user', sender_username]
+    return run_gpg_user(args, sender_username, input_text=plaintext)
+
+
+def decrypt_with_user_key(ciphertext, username):
+    """
+    Decrypt ciphertext using username's private key from their personal homedir.
+    Returns (stdout, stderr, returncode).
+    """
+    ciphertext = ciphertext.strip()
+    while ciphertext.startswith('\n'):
+        ciphertext = ciphertext.lstrip('\n')
+    if not ciphertext.startswith('-----BEGIN'):
+        ciphertext = '-----BEGIN PGP MESSAGE-----\n\n' + ciphertext
+    tmp = PGP_DIR / f'.tmp_dec_{int(time.time())}.asc'
+    tmp.write_text(ciphertext)
+    try:
+        args = ['--decrypt', '--output', '-', str(tmp)]
+        return run_gpg_user(args, username)
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+def get_user_public_key_emails(exclude_username=None):
+    """
+    Return list of public key emails the current user has imported into their keyring.
+    These are the user's "contacts" — only people whose keys they've added via the Keys page
+    or who have messaged them (auto-imported on first receipt) appear here.
+    Excludes the current user from the recipient list.
+    """
+    emails = []
+    if not exclude_username:
+        return emails  # safety: require caller to pass current_user
+
+    # List keys in the current user's personal keyring
+    out, err, code = run_gpg_user(['--list-keys', '--keyid-format=long'], exclude_username)
+    if code != 0:
+        return emails
+
+    # Parse fingerprints from key listing, then match against known pubkey.asc files
+    # Format: "uid  [ unknown] Name <email>" lines follow "pub  rsa4096/FINGERPRINT" lines
+    fingerprint_to_email = {}
+    current_fingerprint = None
+    for line in out.splitlines():
+        stripped = line.lstrip()
+        if stripped.startswith('pub '):
+            # Extract full 40-char fingerprint from pub line
+            parts = stripped.split()
+            fp = next((p for p in parts if len(p.replace(' ', '')) >= 32
+                       and all(c in '0123456789ABCDEF' for c in p.replace(':', '').replace(' ', ''))), None)
+            if fp:
+                # Normalize: remove spaces and take last 16 chars (short keyid) or full fingerprint
+                fp_clean = fp.replace(' ', '').replace(':', '')
+                if len(fp_clean) >= 16:
+                    current_fingerprint = fp_clean[-16:]  # short keyid for matching
+                else:
+                    current_fingerprint = fp_clean
+            else:
+                current_fingerprint = None
+        elif stripped.startswith('uid ') and current_fingerprint:
+            # Extract email from UID line
+            m = re.search(r'<([^<>@]+@[^<>@]+)>', stripped)
+            if m:
+                fingerprint_to_email[current_fingerprint] = m.group(1).strip()
+
+    # For each fingerprint in keyring, find the matching user's pubkey.asc and get email
+    found_emails = set()
+    for short_id, email in fingerprint_to_email.items():
+        # Scan users/*/pubkey.asc to find which user this key belongs to
+        try:
+            for dirent in os.listdir(USERS_DIR):
+                if dirent == exclude_username:
+                    continue
+                pubkey = USERS_DIR / dirent / 'pubkey.asc'
+                if pubkey.exists():
+                    content = pubkey.read_text()
+                    if short_id in content.replace(' ', '').replace(':', ''):
+                        found_emails.add(email)
+                        break
+        except OSError:
+            pass
+
+    return list(found_emails)
 
 # ─── Settings state ────────────────────────────────────────────────────────────
 
@@ -607,79 +1294,101 @@ def index():
 
 @app.route('/compose', methods=['GET', 'POST'])
 def compose():
+    from flask import g
     dark = request.cookies.get(DARK_MODE_COOKIE, '1') == '1'
     reply_to = request.args.get('reply_to', '').strip()
-    keys_raw = list_public_keys()
-    recipients = []
-    for line in keys_raw.splitlines():
-        if 'uid' in line:
-            m = re.search(r'<([^>]+)>', line)
-            if m:
-                recipients.append(m.group(1))
-    recipients = list(dict.fromkeys(recipients))
+    current_user = getattr(g, 'current_user', None)
+    username = current_user['username'] if current_user else None
+    current_email = current_user['pgp_key_email'] if current_user else ''
+
+    # Recipient dropdown: scan users/*/pubkey.asc for all registered users
+    recipients = get_user_public_key_emails(exclude_username=username)
+    recipients.sort()
 
     alert = ''
     output = ''
     if request.method == 'POST':
         action = request.form.get('action')
         msg = request.form.get('message', '').strip()
-        recipient = request.form.get('recipient', '').strip()
-        if action == 'encrypt' and msg and recipient:
+        recipient_email = request.form.get('recipient', '').strip()
+        if action == 'encrypt' and msg and recipient_email:
             confirm = request.form.get('confirm_phrase', '').strip()
             if settings.confirm_guard and confirm != settings.confirm_passphrase:
                 alert = '<div class="alert error">Confirmation phrase mismatch.</div>'
+            elif not username:
+                alert = '<div class="alert error">You must be logged in to send messages.</div>'
             else:
-                ts = datetime.utcnow().strftime('%Y%m%d_%H%M%S')
-                reply_num = settings.next_reply_num()
-                out_path = app.config['PGP_DIR'] / f'reply{reply_num}.asc'
-                out, err, code = encrypt_message(recipient, msg, armor=True, output=out_path)
+                out, err, code = encrypt_to_recipient(recipient_email, msg, username)
                 if code == 0:
-                    # Save to messages.db (source of truth)
-                    content = out_path.read_text(errors='replace')
-                    h = hashlib.sha256(content.encode()).hexdigest()
-                    db_conn = get_db()
-                    db_conn.execute('''
-                        INSERT INTO messages (timestamp, sender, recipient, subject, file_path, content_hash, encrypted_payload, direction)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, 'sent')
-                    ''', (datetime.utcnow().isoformat(), SENDER_IDENTITY, recipient, request.form.get('subject', ''), str(out_path), h, content))
-                    db_conn.commit()
-                    # Update sent_log.json for backwards compat
-                    log_path = app.config['PGP_DIR'] / 'sent_log.json'
-                    log = []
-                    if log_path.exists():
-                        try: log = json.loads(log_path.read_text())
-                        except Exception as e:
-                            logger.error(f"Failed to read sent_log: {e}")
-                    try:
-                        log.append({'timestamp': datetime.utcnow().isoformat(), 'recipient': recipient, 'output': str(out_path)})
-                        log_path.write_text(json.dumps(log, indent=2))
-                    except Exception as e:
-                        logger.error(f"Failed to write sent_log: {e}")
-                    output = f'<div class="alert success">Encrypted → {out_path.name}</div>'
+                    ts = datetime.utcnow().isoformat()
+                    subject = request.form.get('subject', '')[:200]
+                    h = hashlib.sha256(out.encode()).hexdigest()
+                    reply_num = settings.next_reply_num()
+
+                    # Write encrypted blob to SENDER's sent folder: users/{username}/sent/
+                    sent_dir = USERS_DIR / username / 'sent'
+                    sent_dir.mkdir(parents=True, exist_ok=True)
+                    out_path_sent = sent_dir / f'reply{reply_num}.asc'
+                    out_path_sent.write_text(out)
+
+                    # Write encrypted blob to RECIPIENT's inbox folder: users/{recipient}/inbox/
+                    # Find recipient username from their email
+                    recipient_username = None
+                    for dirent in os.listdir(USERS_DIR):
+                        pubkey = USERS_DIR / dirent / 'pubkey.asc'
+                        if pubkey.exists() and recipient_email in pubkey.read_text():
+                            recipient_username = dirent
+                            break
+                    if recipient_username:
+                        inbox_dir = USERS_DIR / recipient_username / 'inbox'
+                        inbox_dir.mkdir(parents=True, exist_ok=True)
+                        out_path_recv = inbox_dir / f'reply{reply_num}.asc'
+                        out_path_recv.write_text(out)
+
+                        # Auto-import sender's pubkey into recipient's keyring so recipient can reply.
+                        # This is the "contact discovery" mechanism: receiving a message automatically
+                        # adds the sender as a contact (they appear in recipient's compose dropdown).
+                        sender_pubkey = USERS_DIR / username / 'pubkey.asc'
+                        if sender_pubkey.exists():
+                            run_gpg_user(['--import', str(sender_pubkey)], recipient_username)
+                    else:
+                        out_path_recv = out_path_sent  # fallback
+
+                    # Record in SENDER's per-user DB as 'sent'
+                    sender_db = get_user_db(username)
+                    sender_db.execute('''
+                        INSERT INTO messages (timestamp, sender, sender_username, recipient, subject, file_path, content_hash, encrypted_payload, direction)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'sent')
+                    ''', (ts, current_email, username, recipient_email, subject, str(out_path_sent), h, out))
+                    sender_db.commit()
+
+                    # Record in RECIPIENT's per-user DB as 'received'
+                    if recipient_username:
+                        recv_db = get_user_db(recipient_username)
+                        recv_db.execute('''
+                            INSERT INTO messages (timestamp, sender, sender_username, recipient, subject, file_path, content_hash, encrypted_payload, direction)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'received')
+                        ''', (ts, current_email, username, recipient_email, subject, str(out_path_recv), h, out))
+                        recv_db.commit()
+
+                    output = f'<div class="alert success">Message encrypted and delivered to {recipient_email}.</div>'
                 else:
                     alert = f'<div class="alert error">Encryption failed: {err}</div>'
         elif action == 'decrypt':
             ciphertext = request.form.get('ciphertext', '').strip()
-            local_user = request.form.get('local_user', '').strip()
-            confirm = request.form.get('confirm_phrase_dec', '').strip()
-            if settings.confirm_guard and confirm != settings.confirm_passphrase:
-                alert = '<div class="alert error">Confirmation phrase mismatch.</div>'
+            if not username:
+                alert = '<div class="alert error">You must be logged in to decrypt.</div>'
             elif ciphertext:
-                out, err, code = decrypt_text(ciphertext, local_user=local_user or None)
+                out, err, code = decrypt_with_user_key(ciphertext, username)
                 if code == 0:
                     output = f'<div class="alert success">Decrypted:</div><div class="output-block">{out}</div>'
                 else:
                     alert = f'<div class="alert error">Decryption failed: {err}</div>'
 
     guard_on = settings.confirm_guard
-    secret_keys_raw = list_secret_keys()
-    local_users = []
-    for line in secret_keys_raw.splitlines():
-        if 'uid' in line:
-            m = re.search(r'<([^>]+)>', line)
-            if m:
-                local_users.append(m.group(1))
-    local_users = list(dict.fromkeys(local_users))
+
+    # Local key selector: show only current user's key (from their personal GPG homedir)
+    local_users = [current_email] if current_email else []
 
     confirm_row_enc = f'''
     <div class="form-row">
@@ -704,7 +1413,7 @@ def compose():
         <label for="recipient">Recipient (encrypt TO)</label>
         <select name="recipient" id="recipient" onchange="saveDraft()">
           <option value="">— select recipient —</option>
-          {' '.join(f'<option value="{r}"{" selected" if r == reply_to else ""}>{r}</option>' for r in recipients)}
+          {' '.join(f'<option value="{html.escape(r)}"{(" selected" if r == reply_to else "")}>{html.escape(r)}</option>' for r in recipients)}
         </select>
       </div>
       <div class="form-row">
@@ -717,7 +1426,7 @@ def compose():
       </div>
       <p style="color:#8b949e;font-size:0.75rem;margin:0">Draft auto-saved locally</p>
       {confirm_row_enc}
-      <button type="submit" class="btn primary">🔒 Encrypt & Save</button>
+      <button type="submit" class="btn primary">🔒 Encrypt & Send</button>
     </form>
     </div>
     <div class="card">
@@ -725,10 +1434,10 @@ def compose():
     <form method="post">
       <input type="hidden" name="action" value="decrypt">
       <div class="form-row">
-        <label for="local_user">Secret key (decrypt WITH)</label>
+        <label for="local_user">Your key (decrypt WITH)</label>
         <select name="local_user" id="local_user">
           <option value="">— auto-detect —</option>
-          {' '.join(f'<option value="{u}">{u}</option>' for u in local_users)}
+          {' '.join(f'<option value="{html.escape(u)}">{html.escape(u)}</option>' for u in local_users)}
         </select>
       </div>
       <div class="form-row">
@@ -764,7 +1473,6 @@ def compose():
         if (draft.message && msgEl && !msgEl.value) {{ msgEl.value = draft.message; }}
         let subEl = document.getElementById('subject');
         if (draft.subject && subEl && !subEl.value) {{ subEl.value = draft.subject; }}
-        // Restore recipient (select element — find matching option)
         let recEl = document.getElementById('recipient');
         if (draft.recipient && recEl) {{
           for (let o of recEl.options) {{ if (o.value === draft.recipient) {{ recEl.value = draft.recipient; break; }} }}
@@ -772,7 +1480,6 @@ def compose():
       }} catch(e) {{}}
     }}
     function clearDraft() {{ localStorage.removeItem(DRAFT_KEY); }}
-    // Clear draft on successful encrypt submit
     document.querySelector('form').addEventListener('submit', function(e) {{
       if (e.submitter && e.submitter.textContent.includes('Encrypt')) clearDraft();
     }});
@@ -782,66 +1489,46 @@ def compose():
 
 @app.route('/inbox')
 def inbox():
+    from flask import g
     dark = request.cookies.get(DARK_MODE_COOKIE, '1') == '1'
-    pgp_dir = app.config['PGP_DIR']
-
-    # Load from SQLite DB — show all messages (DB stores all sent + received)
-    conn = get_db()
-    rows = conn.execute('''
-        SELECT id, timestamp, sender, recipient, subject, file_path, content_hash, "read"
-        FROM messages
-        ORDER BY timestamp DESC
-        LIMIT 50
-    ''').fetchall()
+    current_user = getattr(g, 'current_user', None)
+    username = current_user['username'] if current_user else None
+    current_email = current_user['pgp_key_email'] if current_user else ''
 
     messages = []
-    for r in rows:
-        fp = None
-        try:
-            fp = Path(r['file_path']) if r['file_path'] else None
-            size = fp.stat().st_size if fp and fp.exists() else 0
-        except (OSError, PermissionError, FileNotFoundError):
-            size = 0
-            fp = None
-        messages.append({
-            'id': r['id'],
-            'file': Path(r['file_path']).name if r['file_path'] else '',
-            'timestamp': r['timestamp'],
-            'sender': r['sender'],
-            'recipient': r['recipient'],
-            'subject': r['subject'],
-            'size': size,
-            'read': r['read'] if 'read' in r.keys() else 0,
-        })
+    if username:
+        # Use per-user DB, filtered to messages where current user is recipient
+        conn = get_user_db(username)
+        rows = conn.execute('''
+            SELECT id, timestamp, sender, sender_username, recipient, subject, file_path, content_hash, "read"
+            FROM messages
+            WHERE direction = 'received'
+            ORDER BY timestamp DESC
+            LIMIT 50
+        ''').fetchall()
 
-    # Fallback: scan disk for .asc files not yet in DB (backwards compat)
-    logged_files = {Path(r['file_path']).name for r in rows if r['file_path']}
-    try:
-        disk_files = list(pgp_dir.glob('*.asc'))
-    except (OSError, PermissionError) as e:
-        logger.warning("Cannot glob PGP_DIR %s: %s", pgp_dir, e)
-        disk_files = []
-    for f in sorted(disk_files, key=lambda x: x.stat().st_mtime, reverse=True):
-        if f.name in logged_files:
-            continue
-        if any(f.name.startswith(p) for p in ('out_', 'roundtrip', 'reply_')):
-            continue
-        if '_public.asc' in f.name or '_private.asc' in f.name:
-            continue
-        try:
-            content = f.read_text(errors='replace')
-            if '-----BEGIN PGP MESSAGE-----' in content:
-                messages.append({
-                    'id': None,
-                    'file': f.name,
-                    'timestamp': datetime.fromtimestamp(f.stat().st_mtime).isoformat(),
-                    'sender': 'unknown',
-                    'recipient': '',
-                    'subject': '',
-                    'size': f.stat().st_size,
-                })
-        except (OSError, PermissionError):
-            pass
+        for r in rows:
+            fp = None
+            if r['file_path']:
+                fp = Path(r['file_path'])
+                try:
+                    size = fp.stat().st_size if fp.exists() else 0
+                except (OSError, PermissionError, FileNotFoundError):
+                    size = 0
+                    fp = None
+            messages.append({
+                'id': r['id'],
+                'file': Path(r['file_path']).name if r['file_path'] else '',
+                'file_path': str(r['file_path']) if r['file_path'] else '',
+                'timestamp': r['timestamp'],
+                'sender': r['sender'],
+                'sender_username': r.get('sender_username', ''),
+                'recipient': r['recipient'],
+                'subject': r['subject'] or '',
+                'size': size if fp else 0,
+                'read': r['read'] if 'read' in r.keys() else 0,
+            })
+
 
     messages.sort(key=lambda x: x.get('timestamp', ''), reverse=True)
 
@@ -998,56 +1685,95 @@ def inbox():
 
 @app.route('/inbox/decrypt_file/<filename>')
 def inbox_decrypt_file(filename):
-    """Decrypt a file by filename (for lazy decrypt from inbox)."""
-    pgp_dir = app.config['PGP_DIR']
+    """Decrypt a file by filename using current user's private key."""
+    from flask import g
+    current_user = getattr(g, 'current_user', None)
+    username = current_user['username'] if current_user else None
+    if not username:
+        return jsonify({'error': 'Not authenticated'}), 401
     safe_name = Path(filename).name
-    file_path = pgp_dir / safe_name
-    if not file_path.exists():
+    # File lives in users/{username}/inbox/ or users/{username}/sent/
+    inbox_path = USERS_DIR / username / 'inbox' / safe_name
+    sent_path = USERS_DIR / username / 'sent' / safe_name
+    file_path = inbox_path if inbox_path.exists() else (sent_path if sent_path.exists() else None)
+    if not file_path or not file_path.exists():
         return jsonify({'error': 'File not found'}), 404
     content = file_path.read_text(errors='replace')
-    out, err, code = decrypt_text(content)
+    out, err, code = decrypt_with_user_key(content, username)
     if code == 0:
         return jsonify({'plaintext': out})
     return jsonify({'error': err or 'Decryption failed'}), 500
 
+
 @app.route('/inbox/raw/<filename>')
 def inbox_raw(filename):
-    pgp_dir = app.config['PGP_DIR']
+    """Serve a raw .asc file from the user's inbox or sent dir."""
+    from flask import g
+    current_user = getattr(g, 'current_user', None)
+    username = current_user['username'] if current_user else None
     safe_name = Path(filename).name
-    file_path = pgp_dir / safe_name
-    if not file_path.exists() or not file_path.is_file():
+    if username:
+        inbox_path = USERS_DIR / username / 'inbox' / safe_name
+        sent_path = USERS_DIR / username / 'sent' / safe_name
+        file_path = inbox_path if inbox_path.exists() else (sent_path if sent_path.exists() else None)
+    else:
+        file_path = None
+    if not file_path or not file_path.exists() or not file_path.is_file():
         return 'File not found', 404
     return file_path.read_text(errors='replace'), 200, {'Content-Type': 'text/plain'}
 
+
 @app.route('/inbox/delete_file/<filename>', methods=['DELETE'])
 def inbox_delete_file(filename):
-    """Delete a file from disk (for disk-scanned .asc files not tracked in DB)."""
-    pgp_dir = app.config['PGP_DIR']
+    """Delete a file from the user's inbox or sent dir."""
+    from flask import g
+    current_user = getattr(g, 'current_user', None)
+    username = current_user['username'] if current_user else None
     safe_name = Path(filename).name
-    file_path = pgp_dir / safe_name
-    if file_path.exists() and file_path.is_file():
+    if username:
+        inbox_path = USERS_DIR / username / 'inbox' / safe_name
+        sent_path = USERS_DIR / username / 'sent' / safe_name
+        file_path = inbox_path if inbox_path.exists() else (sent_path if sent_path.exists() else None)
+    else:
+        file_path = None
+    if file_path and file_path.exists() and file_path.is_file():
         file_path.unlink(missing_ok=True)
         return jsonify({'deleted': str(file_path)})
     return jsonify({'error': 'File not found'}), 404
 
 @app.route('/sent')
 def sent():
+    """Show the current user's sent messages from their per-user DB."""
+    from flask import g
     dark = request.cookies.get(DARK_MODE_COOKIE, '1') == '1'
-    settings.load_sent_log()
-    rows = ''
-    for e in reversed(settings.sent_log[-30:]):
-        rows += f'''<tr>
-          <td>{e.get('timestamp','')}</td>
-          <td>{e.get('recipient','')}</td>
-          <td><code>{e.get('output','')}</code></td>
-        </tr>'''
-    table_html = f'<div class="card"><h2>Sent Log</h2><table><thead><tr><th>Time (UTC)</th><th>Recipient</th><th>File</th></tr></thead><tbody>{rows}</tbody></table></div>'
-    body = table_html + f'''
-    <div class="card"><h2>Sent Log File</h2>
-    <p style="color:#8b949e;font-size:0.8rem;margin-bottom:1rem">{app.config['PGP_DIR'] / 'sent_log.json'}</p>
-    <a href="{url_for('clear_sent_log')}" class="btn danger" onclick="return confirm(\'Clear sent log?\')">🗑 Clear Log</a>
+    current_user = getattr(g, 'current_user', None)
+    username = current_user['username'] if current_user else None
+    current_email = current_user['pgp_key_email'] if current_user else ''
+
+    rows_html = ''
+    if username:
+        conn = get_user_db(username)
+        rows = conn.execute('''
+            SELECT id, timestamp, sender, sender_username, recipient, subject, file_path
+            FROM messages
+            WHERE direction = 'sent'
+            ORDER BY timestamp DESC
+            LIMIT 50
+        ''').fetchall()
+        for r in rows:
+            rows_html += f'''<tr>
+              <td>{r['timestamp'][:16]}</td>
+              <td>{r['recipient']}</td>
+              <td><code>{r.get('subject', '')[:40]}</code></td>
+            </tr>'''
+
+    table_html = f'''<div class="card"><h2>Sent Messages</h2>
+    <table><thead><tr><th>Time (UTC)</th><th>Recipient</th><th>Subject</th></tr></thead>
+    <tbody>{rows_html}</tbody></table>
+    {"<p style='color:#8b949e;padding:1rem'>No sent messages.</p>" if not rows_html else ""}
     </div>'''
-    return render('Sent Log', 'sent', body, dark)
+    body = table_html
+    return render('Sent Messages', 'sent', body, dark)
 
 @app.route('/sent/clear')
 def clear_sent_log():
@@ -1078,42 +1804,25 @@ def settings_page():
             elif guard_action == 'enable' and not passphrase:
                 msg = '<div class="alert error">Enable failed — passphrase required.</div>'
 
-        # Web UI Basic Auth password management
-        web_auth_action = request.form.get('web_auth_action', '')
-        if web_auth_action == 'disable':
-            try:
-                _WEB_AUTH_FILE.unlink()
-            except Exception:
-                pass
-            msg = '<div class="alert info">Web UI auth DISABLED — UI is open.</div>'
-        elif web_auth_action == 'set':
-            web_user = (request.form.get('web_user') or '').strip()
-            web_pass = request.form.get('web_pass', '')
-            web_pass2 = request.form.get('web_pass2', '')
-            if not web_user:
-                msg = '<div class="alert error">Username is required.</div>'
-            elif web_pass != web_pass2:
-                msg = '<div class="alert error">Passwords do not match.</div>'
-            elif not web_pass:
-                msg = '<div class="alert error">Password is required to enable auth.</div>'
-            else:
-                from werkzeug.security import generate_password_hash
-                pw_hash = generate_password_hash(web_pass)
-                if _save_web_auth(web_user, pw_hash):
-                    msg = f'<div class="alert success">Web UI auth ENABLED — username: {web_user}</div>'
-                else:
-                    msg = '<div class="alert error">Failed to save credentials.</div>'
-
     guard_on = settings.confirm_guard
     agent_ok = gpg_agent_status() == 'running'
     lockout = settings.lockout_active
     remaining = settings.lockout_remaining
     clipboard_sec = os.environ.get('PGP_CLIPBOARD_CLEAR_SECONDS', '30')
-    web_auth_user, _ = _load_web_auth()
-    web_auth_on = bool(web_auth_user)
+    from flask import g
+    current_user = getattr(g, 'current_user', None)
+    username = current_user['username'] if current_user else ''
+    user_email = current_user.get('pgp_key_email', '') if current_user else ''
 
     body = f'''
     {msg}
+    <div class="card">
+    <h2>Your Account</h2>
+    <table>
+      <tr><td>Username</td><td><code>{username}</code></td></tr>
+      <tr><td>PGP Email</td><td><code>{user_email}</code></td></tr>
+    </table>
+    </div>
     <div class="card">
     <h2>Security</h2>
     <div class="status-bar">
@@ -1126,40 +1835,11 @@ def settings_page():
         <span class="value {'ok' if agent_ok else 'danger'}">{agent_ok}</span>
       </div>
       <div class="status-item">
-        <span class="label">Lockout:</span>
-        <span class="value {'danger' if lockout else 'ok'}">{'LOCKED' if lockout else f'Clear ({remaining} attempts left)'}</span>
-      </div>
-      <div class="status-item">
         <span class="label">Clipboard clear:</span>
         <span class="value">{clipboard_sec}s</span>
       </div>
     </div>
-    <a href="{url_for('kill_agent')}" class="btn danger" onclick="return confirm(\'Restart gpg-agent and clear all cached passphrases?\')">💀 Kill Agent (clear passphrase cache)</a>
-    </div>
-    <div class="card">
-    <h2>Web UI Password</h2>
-    <p style="color:#8b949e;font-size:0.85rem;margin-bottom:1rem">
-      Protect the web UI with HTTP Basic Auth — every browser tab and request requires this password. The mobile app uses Bearer token auth separately and is unaffected.
-      If no password is set the UI is open — anyone on the network can access it.
-    </p>
-    <form method="post" style="margin-bottom:1rem">
-    <input type="hidden" name="web_auth_action" value="set">
-    <div class="form-row">
-      <label for="web_user">Username</label>
-      <input type="text" name="web_user" id="web_user" value="{web_auth_user}" placeholder="admin" autocomplete="username">
-    </div>
-    <div class="form-row">
-      <label for="web_pass">Password</label>
-      <input type="password" name="web_pass" id="web_pass" placeholder="{'Leave blank to keep current' if web_auth_on else 'Enter a password to enable auth'}" autocomplete="current-password">
-    </div>
-    <div class="form-row">
-      <label for="web_pass2">Confirm Password</label>
-      <input type="password" name="web_pass2" id="web_pass2" placeholder="Repeat password" autocomplete="new-password">
-    </div>
-    <button type="submit" class="btn primary">{'Update' if web_auth_on else 'Enable Auth'}</button>
-    {' <button type="submit" name="web_auth_action" value="disable" class="btn" style="margin-left:0.5rem">Disable</button>' if web_auth_on else ''}
-    </form>
-    {'<p><span class="ok">Web UI is PROTECTED</span> — requests require this password.</p>' if web_auth_on else '<p><span class="warn">Web UI is OPEN</span> — anyone on your network can access it without a password.</p>'}
+    <a href="{url_for('kill_agent')}" class="btn danger" onclick="return confirm('Restart gpg-agent and clear all cached passphrases?')">💀 Kill Agent (clear passphrase cache)</a>
     </div>
     <div class="card">
     <h2>Confirmation Guard</h2>
@@ -1185,33 +1865,29 @@ def settings_page():
     <div class="card">
     <h2>Environment</h2>
     <table>
-      <tr><td>PGP_SENDER_ID</td><td><code>{app.config['SENDER_IDENTITY']}</code></td></tr>
       <tr><td>PGP_DIR</td><td><code>{app.config['PGP_DIR']}</code></td></tr>
-      <tr><td>PGP_DB_PATH</td><td><code>{app.config['DB_PATH']}</code></td></tr>
       <tr><td>PGP_CLIPBOARD_CLEAR_SECONDS</td><td><code>{os.environ.get('PGP_CLIPBOARD_CLEAR_SECONDS','30')}</code></td></tr>
-      <tr><td>PGP_MAX_ATTEMPTS</td><td><code>{os.environ.get('PGP_MAX_ATTEMPTS','5')}</code></td></tr>
-      <tr><td>PGP_AUTH_TOKEN</td><td><code style="font-size:0.7rem">{AUTH_TOKEN}</code> <button class="btn small" onclick="regenToken()">🔄 Regenerate</button></td></tr>
     </table>
     </div>
     <div class="card">
-    <h2>Mobile API</h2>
+    <h2>API Access</h2>
     <p style="color:#8b949e;font-size:0.85rem;margin-bottom:1rem">
-      Connect the mobile app to this server. The auth token is required in the <code>Authorization: Bearer &lt;token&gt;</code> header for all <code>/api/*</code> requests.
+      Auth token for <code>/api/*</code> endpoints. Required in the <code>Authorization: Bearer &lt;token&gt;</code> header.
     </p>
     <table>
       <tr><td>Server LAN address</td><td><code>https://{_get_lan_ip()}:8765</code></td></tr>
-      <tr><td>CA certificate</td><td><a href="/settings/ca-cert" class="btn small primary">⬇ Download CA cert</a> — install on Android for TLS</td></tr>
+      <tr><td>CA certificate</td><td><a href="/settings/ca-cert" class="btn small primary">⬇ Download CA cert</a> — install on client devices for TLS</td></tr>
     </table>
     <script>
     async function regenToken() {{
-      if (!confirm('Regenerate the API auth token? The mobile app will need the new token.')) return;
+      if (!confirm('Regenerate the API auth token? All clients will need the new token.')) return;
       let r = await fetch('/settings/regen-token', {{
         method: 'POST',
         headers: {{'Content-Type': 'application/json'}}
       }});
       let d = await r.json();
       document.querySelector('code[style*="font-size:0.7rem"]').textContent = d.token;
-      alert('Token regenerated. Update your mobile app!');
+      alert('Token regenerated. Update your API clients with the new token.');
     }}
     </script>
     </div>
@@ -1295,33 +1971,36 @@ def toggle_dark_mode():
 
 @app.route('/keys', methods=['GET', 'POST'])
 def keys_page():
+    from flask import g
     dark = request.cookies.get(DARK_MODE_COOKIE, '1') == '1'
     msg = ''
-    keys_raw = list_public_keys()
+    current_user = getattr(g, 'current_user', None)
+    username = current_user['username'] if current_user else None
+    keys_raw = list_public_keys(username) if username else ''
 
     if request.method == 'POST':
         action = request.form.get('action')
         if action == 'import':
             key_data = request.form.get('key_data', '').strip()
-            if key_data:
-                out, err, code = import_public_key(key_data)
+            if key_data and username:
+                out, err, code = import_public_key(key_data, username)
                 if code == 0:
                     if 'not changed' in out or 'not changed' in err:
                         msg = '<div class="alert info">Key already imported (no changes).</div>'
                     else:
                         msg = '<div class="alert success">Key imported successfully!</div>'
-                    keys_raw = list_public_keys()  # refresh
+                    keys_raw = list_public_keys(username)  # refresh
                 else:
                     msg = f'<div class="alert error">Import failed: {err or out}</div>'
         elif action == 'delete':
             key_id = request.form.get('key_id', '').strip()
-            if key_id:
+            if key_id and username:
                 # Delete secret key first if it exists (required by GPG before deleting pub key)
-                out, err, code = run_gpg(['--batch', '--yes', '--delete-secret-keys', key_id])
-                out, err, code = run_gpg(['--batch', '--yes', '--delete-keys', key_id])
+                out, err, code = run_gpg_user(['--batch', '--yes', '--delete-secret-keys', key_id], username)
+                out, err, code = run_gpg_user(['--batch', '--yes', '--delete-keys', key_id], username)
                 if code == 0:
                     msg = '<div class="alert success">Key deleted.</div>'
-                    keys_raw = list_public_keys()
+                    keys_raw = list_public_keys(username)
                 else:
                     msg = f'<div class="alert error">Delete failed: {err}</div>'
 
@@ -1466,7 +2145,7 @@ gpg --armor --export your@email.com
 @app.route('/health')
 def health():
     """Public health endpoint — no auth required, used by monitoring."""
-    return {'status': 'ok', 'version': '1.9.1'}
+    return {'status': 'ok', 'version': '2.0.0'}
 
 # ─── Favicon ─────────────────────────────────────────────────────────────────────
 
@@ -1488,87 +2167,132 @@ def favicon():
 @app.route('/api/messages', methods=['GET', 'POST'])
 def api_messages():
     """
-    GET /api/messages — list messages with optional filters
-        ?recipient=... &since=... &sender=... &limit=50 &offset=0
-    POST /api/messages — encrypt and store a new message
+    GET /api/messages — list messages for the authenticated user.
+        ?limit=50 &offset=0
+        Header: X-User-ID (required for Bearer token auth to specify user context)
+    POST /api/messages — encrypt and deliver a new message to a recipient.
+        Header: X-User-ID (required for Bearer token auth)
         body: {"recipient": "...", "plaintext": "...", "subject": "..."}
     """
-    conn = get_db()
+    from flask import g
+    current_user = getattr(g, 'current_user', None)
+    api_username = current_user['username'] if current_user else None
+
+    # For Bearer token auth, X-User-ID header overrides the api user context
+    x_user = request.headers.get('X-User-ID', '').strip()
+    if api_username == 'api' and x_user:
+        # Validate X-User-ID exists in session DB
+        sess_conn = _get_session_db()
+        user_row = sess_conn.execute('SELECT * FROM users WHERE username = ?', (x_user,)).fetchone()
+        if user_row:
+            api_username = x_user
+            g.current_user = dict(user_row)
+
+    if not api_username or api_username == 'api':
+        return jsonify({'error': 'User context required. Use session cookie or X-User-ID header with Bearer token.'}), 401
+
+    username = api_username
+    user_email = g.current_user.get('pgp_key_email', '') if g.current_user else ''
 
     if request.method == 'GET':
-        recipient = request.args.get('recipient', '')
-        sender = request.args.get('sender', '')
-        since = request.args.get('since', '')
-        limit = min(int(request.args.get('limit', 50)), 200)
-        offset = int(request.args.get('offset', 0))
-
-        query = 'SELECT * FROM messages WHERE 1=1'
-        params = []
-        if recipient:
-            query += ' AND recipient = ?'
-            params.append(recipient)
-        if sender:
-            query += ' AND sender = ?'
-            params.append(sender)
-        if since:
-            query += ' AND timestamp >= ?'
-            params.append(since)
-
-        query += ' ORDER BY timestamp DESC LIMIT ? OFFSET ?'
-        params.extend([limit, offset])
-
-        rows = conn.execute(query, params).fetchall()
+        conn = get_user_db(username)
+        rows = conn.execute('''
+            SELECT id, timestamp, sender, sender_username, recipient, subject, file_path, content_hash, "read", direction
+            FROM messages
+            ORDER BY timestamp DESC
+            LIMIT 50
+        ''').fetchall()
         return jsonify([dict(r) for r in rows])
 
-    # POST — encrypt and save new message
+    # POST — encrypt and deliver new message
     data = request.get_json(force=True)
-    recipient = (data.get('recipient') or '').strip()
+    recipient_email = (data.get('recipient') or '').strip()
     plaintext = (data.get('plaintext') or '').strip()
     subject = (data.get('subject') or '').strip()[:200]
 
-    if not recipient or not plaintext:
+    if not recipient_email or not plaintext:
         return jsonify({'error': 'recipient and plaintext are required'}), 400
 
-    # Encrypt via GPG
-    ts = datetime.utcnow().strftime('%Y%m%d_%H%M%S')
-    reply_num = _next_reply_num(conn)
-    out_path = PGP_DIR / f'reply{reply_num}.asc'
-
-    out, err, code = encrypt_message(recipient, plaintext, armor=True, output=str(out_path))
+    out, err, code = encrypt_to_recipient(recipient_email, plaintext, username)
     if code != 0:
         return jsonify({'error': f'Encryption failed: {err}'}), 500
 
-    # Store in DB
-    content = out_path.read_text(errors='replace')
-    h = hashlib.sha256(content.encode()).hexdigest()
-    cursor = conn.execute('''
-        INSERT INTO messages (timestamp, sender, recipient, subject, file_path, content_hash, encrypted_payload, direction)
-        VALUES (?, ?, ?, ?, ?, ?, ?, 'sent')
-    ''', (datetime.utcnow().isoformat(), SENDER_IDENTITY, recipient, subject, str(out_path), h, content))
-    conn.commit()
+    ts = datetime.utcnow().isoformat()
+    h = hashlib.sha256(out.encode()).hexdigest()
+    reply_num = settings.next_reply_num()
 
-    # Update sent_log.json for backwards compat
-    _append_sent_log(recipient, str(out_path))
+    # Write to sender's sent dir
+    sent_dir = USERS_DIR / username / 'sent'
+    sent_dir.mkdir(parents=True, exist_ok=True)
+    out_path_sent = sent_dir / f'reply{reply_num}.asc'
+    out_path_sent.write_text(out)
+
+    # Write to recipient's inbox dir
+    recipient_username = None
+    for dirent in os.listdir(USERS_DIR):
+        pubkey = USERS_DIR / dirent / 'pubkey.asc'
+        if pubkey.exists() and recipient_email in pubkey.read_text():
+            recipient_username = dirent
+            break
+    out_path_recv = out_path_sent
+    if recipient_username:
+        inbox_dir = USERS_DIR / recipient_username / 'inbox'
+        inbox_dir.mkdir(parents=True, exist_ok=True)
+        out_path_recv = inbox_dir / f'reply{reply_num}.asc'
+        out_path_recv.write_text(out)
+
+    # Record in sender's DB
+    sender_db = get_user_db(username)
+    sender_db.execute('''
+        INSERT INTO messages (timestamp, sender, sender_username, recipient, subject, file_path, content_hash, encrypted_payload, direction)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'sent')
+    ''', (ts, user_email, username, recipient_email, subject, str(out_path_sent), h, out))
+    sender_db.commit()
+
+    # Record in recipient's DB
+    if recipient_username:
+        recv_db = get_user_db(recipient_username)
+        recv_db.execute('''
+            INSERT INTO messages (timestamp, sender, sender_username, recipient, subject, file_path, content_hash, encrypted_payload, direction)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'received')
+        ''', (ts, user_email, username, recipient_email, subject, str(out_path_recv), h, out))
+        recv_db.commit()
 
     return jsonify({
-        'id': cursor.lastrowid,
-        'timestamp': datetime.utcnow().isoformat(),
-        'recipient': recipient,
+        'id': reply_num,
+        'timestamp': ts,
+        'recipient': recipient_email,
         'subject': subject,
-        'file': out_path.name,
+        'file': out_path_sent.name,
         'content_hash': h,
     }), 201
 
+
 @app.route('/api/messages/<int:msg_id>', methods=['GET', 'DELETE', 'PATCH'])
 def api_message(msg_id):
-    """GET a single message by ID. DELETE to remove."""
-    conn = get_db()
+    """GET/DELETE/PATCH a message. Requires session cookie or X-User-ID header."""
+    from flask import g
+    current_user = getattr(g, 'current_user', None)
+    api_username = current_user['username'] if current_user else None
+
+    x_user = request.headers.get('X-User-ID', '').strip()
+    if api_username == 'api' and x_user:
+        sess_conn = _get_session_db()
+        user_row = sess_conn.execute('SELECT * FROM users WHERE username = ?', (x_user,)).fetchone()
+        if user_row:
+            api_username = x_user
+            g.current_user = dict(user_row)
+
+    if not api_username or api_username == 'api':
+        return jsonify({'error': 'User context required'}), 401
+
+    username = api_username
+    conn = get_user_db(username)
     row = conn.execute('SELECT * FROM messages WHERE id = ?', (msg_id,)).fetchone()
     if not row:
         return jsonify({'error': 'Not found'}), 404
 
     if request.method == 'DELETE':
-        # Delete .asc file from disk if it exists
         if row['file_path']:
             asc_path = Path(row['file_path'])
             if asc_path.exists():
@@ -1576,15 +2300,15 @@ def api_message(msg_id):
                 except Exception: pass
         conn.execute('DELETE FROM messages WHERE id = ?', (msg_id,))
         conn.commit()
-        return jsonify({'deleted': msg_id, 'file_deleted': bool(row['file_path'])})
+        return jsonify({'deleted': msg_id})
 
     if request.method == 'PATCH':
         conn.execute('UPDATE messages SET "read" = 1 WHERE id = ?', (msg_id,))
         conn.commit()
         return jsonify({'id': msg_id, 'read': 1})
 
-    # GET — decrypt on demand
-    plaintext, err, code = decrypt_text(row['encrypted_payload'])
+    # GET — decrypt
+    plaintext, err, code = decrypt_with_user_key(row['encrypted_payload'], username)
     if code != 0:
         return jsonify({'error': f'Decryption failed: {err}'}), 500
     return jsonify({
@@ -1744,12 +2468,36 @@ def _register_mdns(use_https=True):
 
 
 if __name__ == '__main__':
-    # Initialize DB and import existing sent_log on first run
+    import argparse
+    parser = argparse.ArgumentParser(description='PGP Vault Web UI')
+    parser.add_argument('--init-admin', nargs=3, metavar=('USERNAME', 'PASSWORD', 'EMAIL'),
+                        help='Create an admin user: --init-admin alice password alice@vault.local')
+    args, _ = parser.parse_known_args()
+
+    # Auto-init admin if no users exist (first run)
+    if args.init_admin:
+        username, password, pgp_email = args.init_admin
+        _init_admin_user(username, password, pgp_email)
+        print(f'[*] Admin user created: {username}')
+        sys.exit(0)
+
+    # Initialize session DB
+    _get_session_db()
+
+    # Initialize message DB and import existing sent_log on first run
     conn = get_db()
     imported = _import_sent_log()
 
+    # Ensure at least one admin exists — prompt if missing
+    sess_conn = _get_session_db()
+    admin_count = sess_conn.execute("SELECT COUNT(*) FROM users WHERE is_admin = 1").fetchone()[0]
+    if admin_count == 0:
+        print('[!] No admin user found. Run with:')
+        print('    python pgp_webui.py --init-admin <username> <password> <email>')
+        print('    Example: python pgp_webui.py --init-admin admin mypass admin@vault.local')
+        sys.exit(1)
+
     port = int(os.environ.get('PGP_WEBUI_PORT', '8765'))
-    sender = app.config['SENDER_IDENTITY']
 
     # Generate TLS certs on first run
     _ensure_tls_cert()
@@ -1766,20 +2514,18 @@ if __name__ == '__main__':
      | |         | | |   | |\  || |____ ____) |
      |_|        |___|   |_| \_||______|_____/
 
-   echo-pgp-webui  |  Echo Vault <echo@vault.local>
+   echo-pgp-webui  |  PGP Vault Web UI
    https://github.com/Echo-Computing/echo-pgp-webui
 """)
     scheme = 'https' if use_https else 'http'
-    print(f"[*] PGP Vault Web UI starting on {scheme}://localhost:{port}")
-    print(f"[*] PGP_DIR: {app.config['PGP_DIR']}")
-    print(f"[*] DB_PATH: {app.config['DB_PATH']}")
-    print(f"[*] SENDER_IDENTITY: {sender}")
-    print(f"[*] AUTH_TOKEN: {AUTH_TOKEN[:8]}...")
+    print(f'[*] PGP Vault Web UI starting on {scheme}://localhost:{port}')
+    print(f'[*] PGP_DIR: {app.config["PGP_DIR"]}')
+    print(f'[*] AUTH_TOKEN: {AUTH_TOKEN[:8]}...')
     if imported:
-        print(f"[*] Imported {imported} entries from sent_log.json")
+        print(f'[*] Imported {imported} entries from sent_log.json')
     if not use_https:
-        print(f"[!] Running over HTTP — mobile clients should connect via VPN")
-    print(f"[*] Press Ctrl+C to stop")
+        print(f'[!] Running over HTTP — API clients should connect via VPN')
+    print(f'[*] Press Ctrl+C to stop')
 
     if use_https:
         ssl_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
@@ -1787,3 +2533,4 @@ if __name__ == '__main__':
         app.run(host='0.0.0.0', port=port, debug=False, ssl_context=ssl_ctx)
     else:
         app.run(host='0.0.0.0', port=port, debug=False)
+

@@ -6,22 +6,17 @@ __pycache__/
 *.egg-info/
 .eggs/
 
-# PyInstaller build outputs (desktop EXE)
-desktop/dist/
-desktop/build/
-*.spec
-
-# Flet mobile build output
-mobile_dist/
-pgp_mobile/build/
-
 # Runtime files (generated at runtime — never commit)
 .auth_token
+sessions.db
 messages.db
+users/
 pgpvault.crt
 pgpvault.key
 pgpvault-ca.crt
 pgpvault-ca.key
+pgp_auth_attempts.log
+sent_log.json
 
 # Virtual environments
 venv/
@@ -37,12 +32,3 @@ Thumbs.db
 
 # Logs
 *.log
-compress*.log
-
-# ZSTD compressed output
-dataset_compressed/
-*.zst
-
-# GPG keys — NEVER commit
-*.key
-*.sec
