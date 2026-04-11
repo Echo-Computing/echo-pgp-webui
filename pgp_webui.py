@@ -155,6 +155,7 @@ def _generate_csrf_token():
 
 def csrf_token():
     """Get CSRF token from cookie, or generate a new one if missing."""
+    from flask import g, request
     token = request.cookies.get(CSRF_COOKIE)
     if token:
         return token
@@ -172,6 +173,7 @@ def csrf_input():
 
 def _set_csrf_cookie(resp):
     """Set CSRF cookie on response if a new token was generated this request."""
+    from flask import g
     new_token = getattr(g, '_csrf_token', None)
     if new_token:
         resp.set_cookie(CSRF_COOKIE, new_token, max_age=SESSION_EXPIRY_SECONDS,
@@ -181,6 +183,7 @@ def _set_csrf_cookie(resp):
 
 def validate_csrf():
     """Validate CSRF token from form submission against cookie. Returns True if valid."""
+    from flask import request
     form_token = request.form.get('csrf_token', '')
     cookie_token = request.cookies.get(CSRF_COOKIE, '')
     if not form_token or not cookie_token:
