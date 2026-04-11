@@ -18,6 +18,7 @@ import re
 import sqlite3
 import hmac
 import html
+import hashlib
 import secrets
 import ssl
 import socket
@@ -46,6 +47,7 @@ DB_PATH = Path(os.environ.get('PGP_DB_PATH', str(PGP_DIR / 'messages.db')))
 # ─── Multi-user configuration ────────────────────────────────────────────────
 USERS_DIR = PGP_DIR / 'users'
 SESSION_COOKIE = 'pgp_session'
+CSRF_COOKIE = 'pgp_csrf'
 SESSION_EXPIRY_SECONDS = 86400 * 7   # 7 days
 BRUTEFORCE_WINDOW_SECS = 15 * 60     # 15 minutes
 BRUTEFORCE_MAX_ATTEMPTS = 5           # max failures per IP in window
@@ -139,6 +141,59 @@ def set_security_headers(response):
     response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     response.headers['Content-Security-Policy'] = "default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'"
     return response
+
+
+# ─── CSRF Protection ──────────────────────────────────────────────────────────
+
+def _generate_csrf_token():
+    """Generate a CSRF token and store it in the session DB."""
+    token = secrets.token_hex(32)
+    return token
+
+
+def csrf_token():
+    """Get CSRF token from cookie, or generate a new one if missing."""
+    token = request.cookies.get(CSRF_COOKIE)
+    if token:
+        return token
+    token = getattr(g, '_csrf_token', None)
+    if not token:
+        token = secrets.token_hex(32)
+        g._csrf_token = token
+    return token
+
+
+def csrf_input():
+    """Return HTML hidden input for CSRF token."""
+    return f'<input type="hidden" name="csrf_token" value="{html.escape(csrf_token())}">'
+
+
+def _set_csrf_cookie(resp):
+    """Set CSRF cookie on response if a new token was generated this request."""
+    new_token = getattr(g, '_csrf_token', None)
+    if new_token:
+        resp.set_cookie(CSRF_COOKIE, new_token, max_age=SESSION_EXPIRY_SECONDS,
+                        httponly=True, samesite='Lax', secure=True)
+    return resp
+
+
+def validate_csrf():
+    """Validate CSRF token from form submission against cookie. Returns True if valid."""
+    form_token = request.form.get('csrf_token', '')
+    cookie_token = request.cookies.get(CSRF_COOKIE, '')
+    if not form_token or not cookie_token:
+        return False
+    return hmac.compare_digest(form_token, cookie_token)
+
+
+def csrf_protect(f):
+    """Decorator that validates CSRF token on POST requests."""
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        if request.method == 'POST' and not validate_csrf():
+            return '<h1>403 Forbidden</h1><p>CSRF token validation failed. Please try again.</p>', 403
+        return f(*args, **kwargs)
+    return decorated
 
 # ─── Session DB Infrastructure ─────────────────────────────────────────────────
 
@@ -411,7 +466,8 @@ def handle_exception(e):
 # ─── Login / Logout ─────────────────────────────────────────────────────────────
 
 def _get_login_form(error=''):
-    """Render the login form HTML."""
+    """Render the login form HTML with CSRF token."""
+    csrf = csrf_input()
     error_html = f'<div class="alert error">{error}</div>' if error else ''
     return f'''
     <!doctype html>
@@ -437,6 +493,7 @@ def _get_login_form(error=''):
       <h1>🔐 PGP Vault</h1>
       {error_html}
       <form method="post">
+        {csrf}
         <label for="username">Username</label>
         <input type="text" name="username" id="username" autocomplete="username" autofocus required>
         <label for="password">Password</label>
@@ -450,10 +507,13 @@ def _get_login_form(error=''):
 
 
 @app.route('/login', methods=['GET', 'POST'])
+@csrf_protect
 def login_page():
     """Login page with session-based authentication."""
     if request.method == 'GET':
-        return _get_login_form(), 200
+        resp = app.make_response(_get_login_form())
+        _set_csrf_cookie(resp)
+        return resp
 
     ip_address = request.remote_addr or '127.0.0.1'
     username = (request.form.get('username') or '').strip()
@@ -462,7 +522,9 @@ def login_page():
     # Check brute-force lockout first
     blocked, block_reason = check_login_attempts(ip_address, username)
     if blocked:
-        return _get_login_form(f'Account locked: {block_reason}'), 429
+        resp = app.make_response(_get_login_form(f'Account locked: {block_reason}'))
+        _set_csrf_cookie(resp)
+        return resp, 429
 
     # Look up user
     conn = _get_session_db()
@@ -478,6 +540,8 @@ def login_page():
         resp = app.make_response(redirect(url_for('compose')))
         resp.set_cookie(SESSION_COOKIE, session_id, max_age=SESSION_EXPIRY_SECONDS,
                         httponly=True, samesite='Lax', secure=True)
+        resp.set_cookie(CSRF_COOKIE, csrf_token(), max_age=SESSION_EXPIRY_SECONDS,
+                        httponly=True, samesite='Lax', secure=True)
         return resp
     else:
         # Failed login
@@ -485,11 +549,16 @@ def login_page():
         # Refresh lockout check after recording
         blocked, block_reason = check_login_attempts(ip_address, username)
         if blocked:
-            return _get_login_form(f'Login failed. {block_reason}'), 429
-        return _get_login_form('Invalid username or password'), 200
+            resp = app.make_response(_get_login_form(f'Login failed. {block_reason}'))
+            _set_csrf_cookie(resp)
+            return resp, 429
+        resp = app.make_response(_get_login_form('Invalid username or password'))
+        _set_csrf_cookie(resp)
+        return resp, 200
 
 
 @app.route('/logout', methods=['POST'])
+@csrf_protect
 def logout():
     """Clear session cookie and redirect to login."""
     session_id = request.cookies.get(SESSION_COOKIE)
@@ -548,6 +617,7 @@ def admin_audit():
     for r in locked_ips:
         locked_ips_html += f'''<tr><td>{html.escape(r['ip_address'])}</td><td>{r['c']} failures</td><td>
         <form method="post" action="{url_for('admin_unlock')}">
+          {csrf_input()}
           <input type="hidden" name="ip_address" value="{html.escape(r['ip_address'])}">
           <button type="submit" class="btn small danger">Unlock</button>
         </form></td></tr>'''
@@ -556,6 +626,7 @@ def admin_audit():
     for r in locked_users:
         locked_users_html += f'''<tr><td>{html.escape(r['username'])}</td><td>{r['c']} failures</td><td>
         <form method="post" action="{url_for('admin_unlock')}">
+          {csrf_input()}
           <input type="hidden" name="username" value="{html.escape(r['username'])}">
           <button type="submit" class="btn small danger">Unlock</button>
         </form></td></tr>'''
@@ -581,6 +652,7 @@ def admin_audit():
 
 @app.route('/admin/unlock', methods=['POST'])
 @admin_required
+@csrf_protect
 def admin_unlock():
     """Admin: clear a lockout by IP or username."""
     ip_address = request.form.get('ip_address', '').strip()
@@ -594,6 +666,7 @@ def admin_unlock():
 
 @app.route('/admin/users', methods=['GET', 'POST'])
 @admin_required
+@csrf_protect
 def admin_users():
     """Admin: create, list, and delete user accounts."""
     import html
@@ -620,7 +693,7 @@ def admin_users():
                 msg = '<div class="alert error">Passwords do not match.</div>'
             elif not re.match(r'^[a-zA-Z0-9_.-]{1,64}$', username):
                 msg = '<div class="alert error">Username may only contain letters, numbers, dots, dashes, and underscores (max 64 chars).</div>'
-            elif not re.match(r'^[^<>:@/\\]+@[^<>:@/\\]+$', pgp_email):
+            elif not re.match(r'^[^\s<>:@/\\]+@[^\s<>:@/\\]+$', pgp_email):
                 msg = '<div class="alert error">Invalid email address.</div>'
             else:
                 existing = conn.execute('SELECT id FROM users WHERE username = ?', (username,)).fetchone()
@@ -695,11 +768,13 @@ def admin_users():
           <td>{u['created_at'][:16]}</td>
           <td>
             <form method="post" style="display:inline">
+              {csrf_input()}
               <input type="hidden" name="action" value="delete">
               <input type="hidden" name="username" value="{html.escape(u['username'])}">
               <button type="submit" class="btn small danger" onclick="return confirm('Delete user {html.escape(u["username"])}? This deletes all their messages.')">Delete</button>
             </form>
             <form method="post" style="display:inline">
+              {csrf_input()}
               <input type="hidden" name="action" value="reset_password">
               <input type="hidden" name="user_id" value="{u['id']}">
               <input type="password" name="new_password" placeholder="New password" style="width:120px;margin-bottom:0">
@@ -719,6 +794,7 @@ def admin_users():
     <div class="card">
     <h2>Create User</h2>
     <form method="post">
+      {csrf_input()}
       <input type="hidden" name="action" value="create">
       <div class="form-row">
         <label for="username">Username</label>
@@ -752,7 +828,7 @@ def _generate_gpg_key(username: str, email: str):
     # Validate inputs to prevent GPG batch injection
     if not re.match(r'^[a-zA-Z0-9_.-]{1,64}$', username):
         raise ValueError(f'Invalid username: {username}')
-    if not re.match(r'^[^<>:@/\\]+@[^<>:@/\\]+$', email):
+    if not re.match(r'^[^\s<>:@/\\]+@[^\s<>:@/\\]+$', email):
         raise ValueError(f'Invalid email address: {email}')
 
     user_dir = USERS_DIR / username
@@ -760,8 +836,10 @@ def _generate_gpg_key(username: str, email: str):
     gpg_home = user_dir / '.gnupg'
     gpg_home.mkdir(exist_ok=True)
 
+    # Generate a random passphrase for the private key
+    passphrase = secrets.token_hex(32)
+
     batch = (
-        f'%no-protection\n'
         f'Key-Type: RSA\n'
         f'Key-Length: 4096\n'
         f'Subkey-Type: RSA\n'
@@ -769,6 +847,7 @@ def _generate_gpg_key(username: str, email: str):
         f'Name-Real: {username}\n'
         f'Name-Email: {email}\n'
         f'Expire-Date: 0\n'
+        f'Passphrase: {passphrase}\n'
         f'%commit\n'
     ).encode()
 
@@ -785,6 +864,13 @@ def _generate_gpg_key(username: str, email: str):
         )
         if code == 0 and pub_out:
             (user_dir / 'pubkey.asc').write_text(pub_out)
+        # Store passphrase (only the app needs it for decrypt operations)
+        pass_file = user_dir / '.gpg_passphrase'
+        pass_file.write_text(passphrase)
+        try:
+            pass_file.chmod(0o600)
+        except Exception:
+            pass
     finally:
         tmp.unlink(missing_ok=True)
 
@@ -988,11 +1074,41 @@ def encrypt_to_recipient(recipient_email, plaintext, sender_username, armor=True
     # Import recipient's pubkey into sender's homedir for encryption
     run_gpg_user(['--import', str(recipient_pubkey_path)], sender_username)
 
-    args = ['--batch', '--yes', '--encrypt', '--always-trust']
+    args = ['--batch', '--yes', '--encrypt', '--always-trust', '--pinentry-mode', 'loopback']
+    pass_file = None
+    passphrase = _get_user_passphrase(sender_username)
+    if passphrase:
+        pass_file = _passphrase_file(passphrase)
+        args.extend(['--passphrase-file', str(pass_file)])
     if armor:
         args.append('--armor')
     args += ['--recipient', recipient_email, '--local-user', sender_username]
-    return run_gpg_user(args, sender_username, input_text=plaintext)
+    try:
+        return run_gpg_user(args, sender_username, input_text=plaintext)
+    finally:
+        if pass_file:
+            pass_file.unlink(missing_ok=True)
+
+
+def _get_user_passphrase(username):
+    """Read the stored GPG passphrase for a user's private key."""
+    pass_file = USERS_DIR / username / '.gpg_passphrase'
+    if pass_file.exists():
+        return pass_file.read_text().strip()
+    return None
+
+
+def _passphrase_file(passphrase):
+    """Write passphrase to a temp file and return its path. Caller must unlink."""
+    if not passphrase:
+        return None
+    tmp = PGP_DIR / f'.passphrase_{secrets.token_hex(8)}'
+    tmp.write_text(passphrase)
+    try:
+        tmp.chmod(0o600)
+    except Exception:
+        pass
+    return tmp
 
 
 def decrypt_with_user_key(ciphertext, username):
@@ -1007,11 +1123,22 @@ def decrypt_with_user_key(ciphertext, username):
         ciphertext = '-----BEGIN PGP MESSAGE-----\n\n' + ciphertext
     tmp = PGP_DIR / f'.tmp_dec_{secrets.token_hex(8)}.asc'
     tmp.write_text(ciphertext)
+    pass_file = None
     try:
-        args = ['--decrypt', '--output', '-', str(tmp)]
+        args = ['--decrypt', '--output', '-', '--pinentry-mode', 'loopback']
+        passphrase = _get_user_passphrase(username)
+        if passphrase:
+            pass_file = _passphrase_file(passphrase)
+            args.extend(['--passphrase-file', str(pass_file)])
+        else:
+            # Legacy keys created with %no-protection — still need batch mode
+            args.append('--batch')
+        args.append(str(tmp))
         return run_gpg_user(args, username)
     finally:
         tmp.unlink(missing_ok=True)
+        if pass_file:
+            pass_file.unlink(missing_ok=True)
 
 
 def get_user_public_key_emails(exclude_username=None):
@@ -1267,7 +1394,7 @@ BASE_TEMPLATE = """
     <h1>PGP Vault</h1>
   </div>
   <div class="header-right">
-    {% if current_user %}<span class="header-user">{{ current_user.username }}<form method="post" action="{{ url_for('logout') }}" style="display:inline;margin:0;padding:0 0 0 6px"><button type="submit" class="btn small" style="font-size:0.7rem;padding:1px 6px">Logout</button></form></span>{% endif %}
+    {% if current_user %}<span class="header-user">{{ current_user.username }}<form method="post" action="{{ url_for('logout') }}" style="display:inline;margin:0;padding:0 0 0 6px"><input type="hidden" name="csrf_token" value="{{ csrf_token_val }}"><button type="submit" class="btn small" style="font-size:0.7rem;padding:1px 6px">Logout</button></form></span>{% endif %}
     <div class="links">
     {% for endpoint, label in tabs %}
     <a href="{{ url_for(endpoint) }}" class="{{ 'active' if active_tab == endpoint else '' }}">{{ label }}</a>
@@ -1282,13 +1409,14 @@ BASE_TEMPLATE = """
 <script>
 window.__DARK_CSS__ = {{ dark_css | tojson }};
 window.__LIGHT_CSS__ = {{ light_css | tojson }};
+window.__CSRF_TOKEN__ = {{ csrf_token_val | tojson }};
 function toggleDark() {
   var isDark = document.body.getAttribute("data-dark") === "1";
   var newDark = isDark ? "0" : "1";
   document.body.setAttribute("data-dark", newDark);
   document.getElementById("dark_toggle").textContent = newDark === "1" ? "☀ light" : "🌙 dark";
   document.getElementById("theme-css").textContent = newDark === "1" ? window.__DARK_CSS__ : window.__LIGHT_CSS__;
-  fetch("{{ url_for('toggle_dark_mode') }}", {method:"POST", headers:{"Content-Type":"application/x-www-form-urlencoded"}, body:"dark="+newDark}).catch(function(){});
+  fetch("{{ url_for('toggle_dark_mode') }}", {method:"POST", headers:{"Content-Type":"application/x-www-form-urlencoded"}, body:"dark="+newDark+"&csrf_token="+encodeURIComponent(window.__CSRF_TOKEN__)}).catch(function(){{}});
 }
 </script>
 {{ body | safe }}
@@ -1323,10 +1451,12 @@ def render(title, active_tab, body_html, dark_mode=True, set_cookie=False, curre
         page_css=css_safe,
         url_for=url_for,
         current_user=getattr(g, 'current_user', None),
+        csrf_token_val=csrf_token(),
     )
     resp = app.make_response(html)
     if set_cookie:
         resp.set_cookie(DARK_MODE_COOKIE, '0' if dark_mode else '1')
+    _set_csrf_cookie(resp)
     return resp
 
 # ─── Routes ────────────────────────────────────────────────────────────────────
@@ -1336,6 +1466,7 @@ def index():
     return redirect(url_for('compose'))
 
 @app.route('/compose', methods=['GET', 'POST'])
+@csrf_protect
 def compose():
     from flask import g
     dark = request.cookies.get(DARK_MODE_COOKIE, '1') == '1'
@@ -1454,6 +1585,7 @@ def compose():
     <div class="card">
     <h2>Encrypt</h2>
     <form method="post">
+      {csrf_input()}
       <input type="hidden" name="action" value="encrypt">
       <div class="form-row">
         <label for="recipient">Recipient (encrypt TO)</label>
@@ -1478,6 +1610,7 @@ def compose():
     <div class="card">
     <h2>Decrypt</h2>
     <form method="post">
+      {csrf_input()}
       <input type="hidden" name="action" value="decrypt">
       <div class="form-row">
         <label for="local_user">Your key (decrypt WITH)</label>
@@ -1722,7 +1855,7 @@ def inbox():
     async function deleteFile(filename, btn) {{
       if (!confirm('Delete ' + filename + ' from disk?')) return;
       try {{
-        let resp = await fetch('/inbox/delete_file/' + encodeURIComponent(filename), {{method:'DELETE'}});
+        let resp = await fetch('/inbox/delete_file/' + encodeURIComponent(filename), {{method:'POST', headers:{{'Content-Type':'application/x-www-form-urlencoded'}}, body:'csrf_token='+encodeURIComponent(window.__CSRF_TOKEN__)}});
         if (resp.status === 404) {{
           btn.closest('tr').remove();
           return;
@@ -1774,7 +1907,8 @@ def inbox_raw(filename):
     return file_path.read_text(errors='replace'), 200, {'Content-Type': 'text/plain'}
 
 
-@app.route('/inbox/delete_file/<filename>', methods=['DELETE'])
+@app.route('/inbox/delete_file/<filename>', methods=['POST'])
+@csrf_protect
 def inbox_delete_file(filename):
     """Delete a file from the user's inbox or sent dir."""
     from flask import g
@@ -1826,8 +1960,9 @@ def sent():
     body = table_html
     return render('Sent Messages', 'sent', body, dark)
 
-@app.route('/sent/clear')
+@app.route('/sent/clear', methods=['POST'])
 @admin_required
+@csrf_protect
 def clear_sent_log():
     log_path = app.config['PGP_DIR'] / 'sent_log.json'
     if log_path.exists():
@@ -1836,6 +1971,7 @@ def clear_sent_log():
     return redirect(url_for('sent'))
 
 @app.route('/settings', methods=['GET', 'POST'])
+@csrf_protect
 def settings_page():
     dark = request.cookies.get(DARK_MODE_COOKIE, '1') == '1'
     msg = ''
@@ -1891,7 +2027,10 @@ def settings_page():
         <span class="value">{clipboard_sec}s</span>
       </div>
     </div>
-    <a href="{url_for('kill_agent')}" class="btn danger" onclick="return confirm('Restart gpg-agent and clear all cached passphrases?')">💀 Kill Agent (clear passphrase cache)</a>
+    <form method="post" action="{url_for('kill_agent')}" style="display:inline">
+      {csrf_input()}
+      <button type="submit" class="btn danger" onclick="return confirm('Restart gpg-agent and clear all cached passphrases?')">💀 Kill Agent (clear passphrase cache)</button>
+    </form>
     </div>
     <div class="card">
     <h2>Confirmation Guard</h2>
@@ -1899,6 +2038,7 @@ def settings_page():
       When ON, encrypting and decrypting in the UI requires the phrase below. Disable to use the UI without guard.
     </p>
     <form method="post">
+    {csrf_input()}
     <input type="hidden" name="guard_action" value="disable" id="guard_action_default">
     <div class="toggle-row">
       <span>Guard is {'ON' if guard_on else 'OFF'}</span>
@@ -1935,7 +2075,8 @@ def settings_page():
       if (!confirm('Regenerate the API auth token? All clients will need the new token.')) return;
       let r = await fetch('/settings/regen-token', {{
         method: 'POST',
-        headers: {{'Content-Type': 'application/json'}}
+        headers: {{'Content-Type': 'application/x-www-form-urlencoded'}},
+        body: 'csrf_token=' + encodeURIComponent(window.__CSRF_TOKEN__)
       }});
       let d = await r.json();
       document.querySelector('code[style*="font-size:0.7rem"]').textContent = d.token;
@@ -1983,6 +2124,7 @@ def serve_ca_cert():
 
 @app.route('/settings/regen-token', methods=['POST'])
 @admin_required
+@csrf_protect
 def regen_token():
     """Regenerate the API auth token."""
     global AUTH_TOKEN
@@ -2008,6 +2150,7 @@ def _get_lan_ip():
 
 @app.route('/settings/kill-agent', methods=['POST'])
 @admin_required
+@csrf_protect
 def kill_agent():
     subprocess.run(['gpgconf', '--kill', 'gpg-agent'], capture_output=True)
     subprocess.run(['gpgconf', '--launch', 'gpg-agent'], capture_output=True)
@@ -2016,6 +2159,7 @@ def kill_agent():
     return redirect(url_for('settings_page'))
 
 @app.route('/toggle-dark', methods=['POST'])
+@csrf_protect
 def toggle_dark_mode():
     dark = request.cookies.get(DARK_MODE_COOKIE, '1') == '1'
     resp = app.make_response(redirect(url_for('compose')))
@@ -2025,6 +2169,7 @@ def toggle_dark_mode():
 # ─── Key Management ─────────────────────────────────────────────────────────────
 
 @app.route('/keys', methods=['GET', 'POST'])
+@csrf_protect
 def keys_page():
     from flask import g
     dark = request.cookies.get(DARK_MODE_COOKIE, '1') == '1'
@@ -2051,8 +2196,18 @@ def keys_page():
             key_id = request.form.get('key_id', '').strip()
             if key_id and username:
                 # Delete secret key first if it exists (required by GPG before deleting pub key)
-                out, err, code = run_gpg_user(['--batch', '--yes', '--delete-secret-keys', key_id], username)
-                out, err, code = run_gpg_user(['--batch', '--yes', '--delete-keys', key_id], username)
+                del_args = ['--batch', '--yes', '--pinentry-mode', 'loopback']
+                pass_file = None
+                passphrase = _get_user_passphrase(username)
+                if passphrase:
+                    pass_file = _passphrase_file(passphrase)
+                    del_args.extend(['--passphrase-file', str(pass_file)])
+                del_args.extend(['--delete-secret-keys', key_id])
+                out, err, code = run_gpg_user(del_args, username)
+                if pass_file:
+                    pass_file.unlink(missing_ok=True)
+                del_args = ['--batch', '--yes', '--delete-keys', key_id]
+                out, err, code = run_gpg_user(del_args, username)
                 if code == 0:
                     msg = '<div class="alert success">Key deleted.</div>'
                     keys_raw = list_public_keys(username)
@@ -2152,6 +2307,7 @@ def keys_page():
         <td style="padding:0.5rem">{expiry_badge}</td>
         <td style="padding:0.5rem">
           <form method="post" style="display:inline">
+            {csrf_input()}
             <input type="hidden" name="action" value="delete">
             <input type="hidden" name="key_id" value="{delete_key}">
             <button type="submit" class="btn small danger" onclick="return confirm('Delete this public key?')">Delete</button>
@@ -2168,6 +2324,7 @@ def keys_page():
       Their public key is a <strong>.asc</strong> file they export from their GPG setup.
     </p>
     <form method="post">
+      {csrf_input()}
       <input type="hidden" name="action" value="import">
       <div class="form-row">
         <label for="key_data">Public key block (-----BEGIN PGP PUBLIC KEY BLOCK-----)</label>
