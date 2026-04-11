@@ -1418,13 +1418,14 @@ BASE_TEMPLATE = """
 window.__DARK_CSS__ = {{ dark_css | tojson }};
 window.__LIGHT_CSS__ = {{ light_css | tojson }};
 window.__CSRF_TOKEN__ = {{ csrf_token_val | tojson }};
+window.__TOGGLE_URL__ = {{ url_for('toggle_dark_mode') | tojson }};
 function toggleDark() {
   var isDark = document.body.getAttribute("data-dark") === "1";
   var newDark = isDark ? "0" : "1";
   document.body.setAttribute("data-dark", newDark);
   document.getElementById("dark_toggle").textContent = newDark === "1" ? "☀ light" : "🌙 dark";
   document.getElementById("theme-css").textContent = newDark === "1" ? window.__DARK_CSS__ : window.__LIGHT_CSS__;
-  fetch("{{ url_for('toggle_dark_mode') }}", {method:"POST", headers:{"Content-Type":"application/x-www-form-urlencoded"}, body:"dark="+newDark+"&csrf_token="+encodeURIComponent(window.__CSRF_TOKEN__)}).catch(function(){{}});
+  fetch(window.__TOGGLE_URL__, {method:"POST", headers:{"Content-Type":"application/x-www-form-urlencoded"}, body:"dark="+newDark+"&csrf_token="+encodeURIComponent(window.__CSRF_TOKEN__)}).catch(function(){});
 }
 </script>
 {{ body | safe }}
