@@ -932,7 +932,7 @@ def import_public_key(key_data: str, username: str) -> tuple[str, str, int]:
     leading = key_data[:len(key_data) - len(armor)]
     if armor.startswith('-----BEGIN') and not leading.endswith('\n\n'):
         key_data = '\n' + key_data
-    tmp = app.config['PGP_DIR'] / f'.tmp_import_{int(time.time())}.asc'
+    tmp = app.config['PGP_DIR'] / f'.tmp_import_{secrets.token_hex(8)}.asc'
     tmp.write_text(key_data)
     out, err, code = run_gpg_user(['--import', str(tmp)], username)
     try:
@@ -968,7 +968,7 @@ def encrypt_to_recipient(recipient_email, plaintext, sender_username, armor=True
             pubkey = USERS_DIR / dirent / 'pubkey.asc'
             if pubkey.exists():
                 content = pubkey.read_text()
-                if recipient_email in content:
+                if f'<{recipient_email}>' in content:
                     recipient_pubkey_path = pubkey
                     break
     except OSError:
@@ -997,7 +997,7 @@ def decrypt_with_user_key(ciphertext, username):
         ciphertext = ciphertext.lstrip('\n')
     if not ciphertext.startswith('-----BEGIN'):
         ciphertext = '-----BEGIN PGP MESSAGE-----\n\n' + ciphertext
-    tmp = PGP_DIR / f'.tmp_dec_{int(time.time())}.asc'
+    tmp = PGP_DIR / f'.tmp_dec_{secrets.token_hex(8)}.asc'
     tmp.write_text(ciphertext)
     try:
         args = ['--decrypt', '--output', '-', str(tmp)]
@@ -1406,7 +1406,7 @@ def compose():
                         ''', (ts, current_email, username, recipient_email, subject, str(out_path_recv), h, out))
                         recv_db.commit()
 
-                    output = f'<div class="alert success">Message encrypted and delivered to {recipient_email}.</div>'
+                    output = f'<div class="alert success">Message encrypted and delivered to {html.escape(recipient_email)}.</div>'
                 else:
                     alert = f'<div class="alert error">Encryption failed: {html.escape(err)}</div>'
         elif action == 'decrypt':
@@ -1419,7 +1419,7 @@ def compose():
             elif ciphertext:
                 out, err, code = decrypt_with_user_key(ciphertext, username)
                 if code == 0:
-                    output = f'<div class="alert success">Decrypted:</div><div class="output-block">{out}</div>'
+                    output = f'<div class="alert success">Decrypted:</div><div class="output-block">{html.escape(out)}</div>'
                 else:
                     alert = f'<div class="alert error">Decryption failed: {html.escape(err)}</div>'
 
@@ -2112,7 +2112,7 @@ def keys_page():
       </tr>'''
     for k in keys:
         fprint = k.get('fingerprint', '')
-        uid_str = '<br>'.join(k['uids'])
+        uid_str = '<br>'.join(html.escape(u) for u in k['uids'])
         # Use fingerprint (full or last 16 chars) as the deletable key identifier
         short_id = fprint[-16:] if fprint else k.get('keyid', '')
         delete_key = fprint if fprint else short_id
