@@ -1101,7 +1101,7 @@ header .links a:hover { color: #e6edf3; }
 .btn.danger:hover { background: #f8514922; }
 .btn.primary { background: #238636; border-color: #238636; }
 .btn.primary:hover { background: #2ea043; transform: translateY(-1px); box-shadow: 0 3px 12px rgba(46,160,67,0.4); }
-.card { background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 0; margin-bottom: 1.5rem; box-shadow: 0 4px 20px rgba(0,0,0,0.35); overflow: hidden; }
+.card { background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 0; margin-bottom: 1.5rem; box-shadow: 0 4px 20px rgba(0,0,0,0.35); }
 .card h2 { font-size: 0.75rem; font-weight: 700; color: #8b949e; text-transform: uppercase; letter-spacing: 0.1em; margin-bottom: 0; padding: 0.9rem 1.25rem 0.8rem; border-bottom: 1px solid #21262d; border-left: 3px solid #30363d; background: linear-gradient(135deg, #1c2128 0%, #161b22 100%); }
 .card > *:not(h2) { padding: 1.1rem 1.25rem; }
 label { display: block; margin-bottom: 0.5rem; color: #8b949e; font-size: 0.85rem; }
@@ -1137,10 +1137,10 @@ tr:hover td { background: #21262d; }
 .grid2 { display: flex; gap: 1rem; flex-wrap: wrap; }
 .grid2 > .card { flex: 1 1 380px; }
 table { table-layout: auto; }
-td { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-td code { overflow: hidden; text-overflow: ellipsis; display: block; }
+td { padding: 0.5rem; border-bottom: 1px solid #21262d; }
 td.col-actions { white-space: nowrap; overflow: visible; }
 td.col-fprint { font-family: 'Courier New', Courier, monospace; font-size: 0.78rem; color: #8b949e; }
+td code { font-size: 0.85rem; }
 @keyframes fadeSlideIn { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
 .card { animation: fadeSlideIn 0.35s ease forwards; }
 .card:nth-child(2) { animation-delay: 0.05s; }
@@ -1205,9 +1205,11 @@ tr:hover td { background: #f6f8fa; }
 .output-block { background: #f6f8fa; border: 1px solid #d0d7de; border-radius: 6px; padding: 1rem; font-size: 0.8rem; white-space: pre-wrap; word-break: break-all; max-height: 300px; overflow-y: auto; }
 .grid2 { display: flex; gap: 1rem; flex-wrap: wrap; }
 .grid2 > .card { flex: 1 1 380px; }
-table { table-layout: fixed; }
-td { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-td code { overflow: hidden; text-overflow: ellipsis; display: block; }
+table { table-layout: auto; }
+td { padding: 0.5rem; border-bottom: 1px solid #d0d7de; }
+td.col-actions { white-space: nowrap; overflow: visible; }
+td.col-fprint { font-family: 'Courier New', Courier, monospace; font-size: 0.78rem; color: #57606a; }
+td code { font-size: 0.85rem; }
 """
 
 BASE_TEMPLATE = """
