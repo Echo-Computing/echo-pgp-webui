@@ -1235,7 +1235,8 @@ BASE_TEMPLATE = """
     <a href="{{ url_for(endpoint) }}" class="{{ 'active' if active_tab == endpoint else '' }}">{{ label }}</a>
     {% endfor %}
     {% if current_user and current_user.is_admin %}
-    <a href="{{ url_for('admin_users') }}" class="{{ 'active' if active_tab == 'admin_users' else '' }}">Admin</a>
+    <a href="{{ url_for('admin_users') }}" class="{{ 'active' if active_tab == 'admin_users' else '' }}">Users</a>
+    <a href="{{ url_for('admin_audit') }}" class="{{ 'active' if active_tab == 'admin_audit' else '' }}">Audit</a>
     {% endif %}
     <a href="#" id="dark_toggle" onclick="toggleDark(); return false;" style="background:none;border:none;color:#8b949e;cursor:pointer;font-size:0.8rem;text-decoration:none">{{ '☀ light' if dark_mode else '🌙 dark' }}</a>
   </div>
