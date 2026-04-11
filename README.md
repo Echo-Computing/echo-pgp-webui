@@ -2,11 +2,19 @@
 
 A standalone, self-hosted Flask web interface for GPG encrypt/decrypt operations. SQLite-backed message storage with multi-user support — everything stays on your machine.
 
-**Use cases:**
-- Encrypt messages to friends using their public PGP keys
-- Decrypt messages sent to you by anyone
-- Integrate into AI pipelines that need to encrypt LLM outputs or decrypt inputs
-- Collaborate securely with friends via encrypted file drops
+## Features at a Glance
+
+- **Encrypt/Decrypt** — PGP message encryption and decryption in the browser
+- **Multi-user** — per-user GPG homedirs, message databases, and keyrings
+- **Inbox** — messages delivered to recipients on the same server, lazy decrypt
+- **Key Management** — import, list, and delete public keys; auto-import on message receipt
+- **Dark/Light Mode** — toggle with persistent cookie
+- **Admin Panel** — create/delete users, reset passwords, view audit log, unlock accounts
+- **Confirmation Guard** — optional passphrase before encrypt/decrypt operations
+- **CSRF Protection** — double-submit cookie pattern on all forms
+- **REST API** — full message CRUD via Bearer token auth
+- **HTTPS by default** — self-signed CA + server cert auto-generated on first launch
+- **Mobile-friendly** — responsive layout adapts to phone, tablet, and desktop
 
 ---
 
@@ -17,20 +25,15 @@ git clone https://github.com/Echo-Computing/echo-pgp-webui
 cd echo-pgp-webui
 pip install -r requirements-server.txt
 
-# Generate HTTPS certificates (run once before first launch)
-python tools/generate-cert.py
+# Create an admin account (password must be 8+ characters)
+python pgp_webui.py --init-admin admin yourpassword admin@example.com
 
-# Create an admin account
-python pgp_webui.py --init-admin <username> <password> <email@example.com>
-
-# Start the server
+# Start the server — HTTPS certs are auto-generated on first launch
 python3 pgp_webui.py
 # Opens https://localhost:8765
 ```
 
-> **HTTPS note:** The server uses a self-signed certificate. Your browser will show
-> "Not private" or "Unsafe" on first visit — this is normal. Click **Advanced →
-> Proceed to localhost (unsafe)**.
+> **HTTPS note:** The server uses a self-signed certificate. Your browser will show "Not private" or "Unsafe" on first visit — click **Advanced → Proceed to localhost (unsafe)**. To suppress the warning on other devices, download the CA cert from Settings and install it.
 
 ---
 
@@ -55,12 +58,12 @@ gpg --version
 GPG is bundled with Git. If you installed Git, you already have GPG:
 
 ```bash
-# Verify
 gpg --version
 # Should show "gpg (GnuPG) 2.4.x" from "C:\Program Files\Git\usr\bin\gpg.exe"
 ```
 
 **Windows (option B — GnuPG standalone)**
+
 - Download from [gpg4win.org](https://www.gpg4win.org) and install
 - The web UI auto-detects `C:\Program Files (x86)\GnuPG\bin\gpg.exe`
 
@@ -68,7 +71,6 @@ gpg --version
 
 ```bash
 sudo apt update && sudo apt install gnupg
-# Verify
 gpg --version
 ```
 
@@ -79,14 +81,12 @@ export GNUPGHOME="$HOME/.gnupg"
 export PGP_DIR="$HOME/.gnupg"
 ```
 
-> **Note:** If you switch between Windows GPG and WSL GPG with the same homedir,
-> key permissions and agent sockets can conflict. Use separate homedirs per environment.
+> **WSL Note:** If you switch between Windows GPG and WSL GPG with the same homedir, key permissions and agent sockets can conflict. Use separate homedirs per environment.
 
 **macOS**
 
 ```bash
 brew install gnupg
-# Verify
 gpg --version
 ```
 
@@ -94,7 +94,6 @@ gpg --version
 
 ```bash
 sudo apt update && sudo apt install gnupg
-# Verify
 gpg --version
 ```
 
@@ -102,7 +101,6 @@ gpg --version
 
 ```bash
 sudo dnf install gnupg
-# Verify
 gpg --version
 ```
 
@@ -110,43 +108,19 @@ gpg --version
 
 ```bash
 sudo pacman -S gnupg
-# Verify
 gpg --version
 ```
 
-### 2. GPG Directory Layout
+### 2. Environment Variables
 
-Your `PGP_DIR` should contain:
-
-```
-~/.gnupg/
-├── private-keys-v1.d/     # your private keys (NEVER share these)
-├── public-keys-v1.d/       # imported friends' public keys
-├── trustdb.gpg
-└── gpg.conf
-```
-
-On Windows, GPG's home is typically:
-- **Git Bash / MSYS2:** `C:\Program Files\Git\usr\bin\gpg.exe` (auto-detected)
-- **GnuPG standalone:** `C:\Program Files (x86)\GnuPG\bin\gpg.exe`
-
-### 3. Generate Your Own PGP Key (First Time)
-
-```bash
-gpg --full-generate-key
-# Choose RSA 4096, your email, and a strong passphrase
-```
-
-### 4. Configure the Web UI
-
-| Environment Variable | Required | Default | Description |
+| Variable | Required | Default | Description |
 |---|---|---|---|
-| `PGP_SENDER_ID` | **Yes** | — | Your sending key — email or key ID (e.g. `you@example.com`) |
-| `PGP_DIR` | No | `~/.gnupg` | Path to your GPG home directory |
-| `PGP_DB_PATH` | No | `PGP_DIR/messages.db` | Path to SQLite database for message storage |
+| `PGP_DIR` | No | Script's parent directory | Root directory for keys, certs, databases |
+| `PGP_DB_PATH` | No | `PGP_DIR/messages.db` | Path to legacy shared message DB |
 | `PGP_WEBUI_PORT` | No | `8765` | Port to listen on |
 | `PGP_CLIPBOARD_CLEAR_SECONDS` | No | `30` | Auto-clear clipboard after N seconds |
-| `PGP_MAX_ATTEMPTS` | No | `5` | Failed decrypt attempts before lockout |
+| `PGP_MAX_ATTEMPTS` | No | `5` | Failed login attempts before lockout |
+| `PGP_CORS_ORIGINS` | No | (empty) | Comma-separated allowed origins for API CORS |
 | `SECRET_KEY` | No | random | Flask session secret |
 
 ---
@@ -158,62 +132,82 @@ PGP Vault supports multiple users with per-user isolation:
 - **Per-user GPG homedir** — each user's private keys are isolated at `users/{username}/.gnupg/`
 - **Per-user message database** — each user has their own `users/{username}/messages.db`
 - **Per-user public keys** — each user's keyring is separate; importing a key = adding a contact
+- **Per-user key passphrase** — new keys are generated with a random 64-char passphrase, stored in `users/{username}/.gpg_passphrase`
 - **Admin panel** — create/delete users, reset passwords, assign admin role
 - **Brute-force protection** — 5 failed login attempts per IP triggers a 15-minute lockout
 
 ### Creating Users
 
 ```bash
-# Create the first admin user
+# Create the first admin user (password must be 8+ characters)
 python pgp_webui.py --init-admin admin yourpassword admin@example.com
 ```
 
 After that, create additional users via the **Admin → Users** page in the web UI. Each new user automatically gets:
-- A GPG keypair (RSA-4096, no passphrase)
+
+- A GPG keypair (RSA-4096, passphrase-protected)
 - An isolated GPG homedir and message database
 - Other users' public keys auto-imported into their keyring
 
 ---
 
-## Friend-to-Friend Encrypted Messaging
+## Messaging People Outside Your Network
 
-### Exchanging Keys (Both Sides)
+PGP Vault works with **anyone who uses PGP**, not just people on your server. Here's how to communicate with friends, colleagues, or contacts on other platforms:
 
-**You → Friend:** Export and share your public key
+### How It Works
 
-```bash
-gpg --armor --export your@email.com > my_public_key.asc
-```
+PGP uses **public/private key pairs**. You share your **public key** with others; they use it to encrypt messages that only your **private key** can decrypt. The reverse is also true — you encrypt with their public key, and they decrypt with their private key. The server never sees plaintext.
 
-**Friend → You:** They do the same and send you their `.asc` file.
+### Step 1: Share Your Public Key
 
-### Import Your Friend's Key
+Your public key is at `PGP_DIR/users/yourname/pubkey.asc` — or go to **Keys** in the web UI to view and copy it. Share it via any channel:
 
-1. Go to **Keys** in the navigation bar
-2. Paste their public key block into the import box
+- Email it as an attachment
+- Post it on a keyserver (`gpg --send-keys YOUR_KEY_ID`)
+- Share it via Signal, Telegram, USB drive, etc.
+
+### Step 2: Import Their Public Key
+
+When someone sends you their public key:
+
+1. Go to **Keys** → **Import a Friend's Public Key**
+2. Paste the `-----BEGIN PGP PUBLIC KEY BLOCK-----` block
 3. Click **Import Key**
 
-```
------BEGIN PGP PUBLIC KEY BLOCK-----
+Their email now appears in your **Recipient** dropdown on the Compose page.
 
-hQGMAwQh...
-... (their full public key)
------END PGP PUBLIC KEY BLOCK-----
-```
-
-### Send an Encrypted Message
+### Step 3: Send an Encrypted Message
 
 1. Go to **Compose**
 2. Select your friend from the **Recipient** dropdown
 3. Type your message
-4. Click **Encrypt & Save** — saves `replyN.asc` to your `PGP_DIR`
-5. Send the `.asc` file to your friend via any channel (email, Signal, file drop)
+4. Click **Encrypt & Send**
 
-### Decrypt a Received Message
+The encrypted `.asc` file is stored in your Sent log. Copy or download the ciphertext and send it to your friend via **any channel** — email, Signal, Telegram, USB drive, carrier pigeon. Only they can decrypt it.
 
-1. Go to **Compose**
-2. In the **Decrypt** panel, paste the `.asc` content
-3. Click **Decrypt** — the plaintext appears below
+### Step 4: Receive an Encrypted Message
+
+When someone sends you an encrypted `.asc` file:
+
+1. Copy the `-----BEGIN PGP MESSAGE-----` block
+2. Go to **Compose** → **Decrypt** panel
+3. Paste the ciphertext
+4. Click **Decrypt** — the plaintext appears below
+
+### For Friends Not Using PGP Vault
+
+Your friends don't need to install PGP Vault. They just need GPG on their own machine:
+
+```bash
+# They encrypt to you:
+echo "Secret message" | gpg --armor --encrypt --recipient your@email.com --output message.asc
+
+# They decrypt from you:
+gpg --decrypt message.asc
+```
+
+Or they can use any PGP-compatible tool: GPG4Win, Kleopatra, Mailvelope, OpenKeychain (Android), etc.
 
 ---
 
@@ -221,344 +215,45 @@ hQGMAwQh...
 
 Use the Web UI as a local API for AI pipelines that need encrypted I/O.
 
-### With Local LLMs (LM Studio, Ollama, etc.)
+### REST API
 
-```python
-import requests
-
-# Encrypt your prompt before sending to local AI
-response = requests.post("http://localhost:8765/encrypt", json={
-    "plaintext": "Summarize this document...",
-    "recipient": "friend@friend.com"
-})
-ciphertext = response.json()["ciphertext"]
-
-# Send ciphertext to AI, get encrypted response back...
-# Then decrypt locally:
-decrypted = requests.post("http://localhost:8765/decrypt", json={
-    "ciphertext": ai_response_ciphertext
-})
-print(decrypted.json()["plaintext"])
-```
-
-### Via CLI (script-friendly)
+All `/api/*` endpoints require a Bearer token (shown on the Settings page):
 
 ```bash
-# Encrypt — pipe plaintext to gpg, save as .asc
-echo "Hello world" | gpg --armor --encrypt --recipient friend@friend.com \
-  --output message.asc
-
-# Decrypt — read .asc file, output to stdout
-gpg --decrypt message.asc
-
-# Or use the web UI's compose endpoint directly:
-curl -X POST http://localhost:8765/compose \
-  -d "action=decrypt" \
-  -d "ciphertext=$(cat message.asc)"
+TOKEN=$(cat PGP_DIR/.auth_token)
+curl -H "Authorization: Bearer $TOKEN" https://localhost:8765/api/messages
 ```
-
-### AI-as-a-Judgment Use Case
-
-Encrypt sensitive documents client-side (in-browser or via this UI) before sending to an AI API — the AI never sees plaintext, only the encrypted blob. You decrypt the response locally.
-
-```python
-# Full example: encrypt → send to AI API → decrypt response
-import requests, json
-
-plaintext = "Here's my medical record, please summarize..."
-recipient = "ai-service@openai.com"  # the AI service's public key
-
-# Encrypt first
-enc_resp = requests.post("http://localhost:8765/compose", data={
-    "action": "encrypt",
-    "message": plaintext,
-    "recipient": recipient
-})
-
-# Send to AI (AI decrypts with its private key, re-encrypts response to you)
-ai_response = callservice(key=enc_resp["ciphertext"])
-
-# Decrypt AI's response
-dec_resp = requests.post("http://localhost:8765/compose", data={
-    "action": "decrypt",
-    "ciphertext": ai_response.encrypted_blob
-})
-print(dec_resp["plaintext"])
-```
-
----
-
-## Security Features
-
-### Confirmation Guard
-The **Settings → Confirmation Guard** adds a passphrase prompt before encrypt/decrypt operations. Useful on shared machines.
-
-### GPG Agent
-
-The GPG Agent (`gpg-agent`) is a daemon that comes bundled with GPG — you don't install it separately. It caches your private key passphrase in memory so you don't have to retype it on every operation.
-
-**Do home users need it?** It depends on your setup:
-
-- **Local AI only, single-user machine, no roommates/partners:** GPG Agent is optional. You'll be prompted for your passphrase each time you encrypt/decrypt. If you prefer not to deal with this, GPG Agent caches it for you automatically once started.
-- **Shared machine, even at home:** GPG Agent is recommended — set a short cache TTL (see below).
-- **AI running on a different machine than the web UI:** GPG Agent runs wherever your private keys are (i.e., the machine running the web UI).
-
-**Check if GPG Agent is running:**
-
-```bash
-gpg-agent --version          # confirms it's installed
-gpgconf --list-dir agent     # shows agent socket path
-```
-
-**Configure passphrase cache TTL** (optional — add to `~/.gnupg/gpg.conf` or `%APPDATA%\gnupg\gpg.conf`):
-
-```
-default-cache-ttl 3600       # cache passphrase for 1 hour
-max-cache-ttl 86400          # max cache time: 24 hours
-```
-
-**Restart agent after changing config:**
-
-```bash
-gpgconf --kill gpg-agent    # stop
-gpg-agent --daemon          # start fresh (or just start the web UI)
-```
-
-The **Settings → Kill Agent** button in the web UI does both steps — kills the agent and relaunches it with a fresh cache.
-
-**WSL特别注意:** If you're using WSL GPG with the web UI on Windows, make sure both environments use the same `GNUPGHOME` path or different homedirs to avoid socket conflicts.
-
-### Clipboard Auto-Clear
-Decrypted plaintext is copied to clipboard and auto-clears after 30 seconds (configurable via `PGP_CLIPBOARD_CLEAR_SECONDS`).
-
-### Lockout
-After 5 failed decrypt attempts (wrong key/passphrase), the UI locks for 5 minutes.
-
----
-
-## File Layout
-
-```
-echo-pgp-webui/
-├── pgp_webui.py              # Flask application — all routes, DB logic, and templates inline
-├── requirements-server.txt   # pip install -r requirements-server.txt
-├── tools/
-│   └── generate-cert.py      # Generate self-signed CA + server TLS certificates
-├── README.md
-├── LICENSE
-└── .gitignore
-
-PGP_DIR/                      # set via PGP_DIR env var (default: script's parent directory)
-├── sessions.db               # SQLite — users, sessions, login attempts
-├── .auth_token               # Bearer token for API access
-├── pgpvault.crt              # TLS server certificate
-├── pgpvault.key              # TLS server private key
-├── pgpvault-ca.crt           # TLS CA certificate
-├── pgpvault-ca.key           # TLS CA private key
-└── users/
-    └── {username}/
-        ├── .gnupg/           # per-user GPG homedir (private keys isolated)
-        ├── messages.db       # per-user SQLite — message metadata + encrypted payloads
-        ├── pubkey.asc        # user's exported public key
-        ├── inbox/            # received .asc files
-        └── sent/             # sent .asc files
-```
-
-### SQLite Database Schema
-
-The `messages.db` stores all message metadata and encrypted payloads:
-
-```sql
-CREATE TABLE messages (
-    id              INTEGER PRIMARY KEY AUTOINCREMENT,
-    timestamp       TEXT    NOT NULL,        -- ISO 8601, e.g. "2026-03-30T03:14:47"
-    sender          TEXT    NOT NULL,        -- sender email/key ID
-    sender_username TEXT    DEFAULT '',
-    recipient       TEXT    NOT NULL,        -- recipient email/key ID
-    subject         TEXT    DEFAULT '',
-    file_path       TEXT    DEFAULT '',      -- path to .asc file on disk
-    content_hash    TEXT    NOT NULL,        -- SHA-256 of encrypted payload
-    verified        INTEGER DEFAULT 0,       -- GPG signature verification
-    encrypted_payload TEXT  NOT NULL,        -- full ASCII-armored PGP message
-    direction       TEXT    DEFAULT 'sent',  -- 'sent' or 'received'
-    read            INTEGER DEFAULT 0,       -- 0 = unread, 1 = read
-    created_at      TEXT    DEFAULT (datetime('now'))
-);
-
-CREATE INDEX idx_recipient    ON messages(recipient);
-CREATE INDEX idx_timestamp   ON messages(timestamp);
-CREATE INDEX idx_sender      ON messages(sender);
-```
-
-> **Security:** The `encrypted_payload` column holds the full ASCII-armored PGP message — private keys never leave the GPG keyring, only the ciphertext is in the DB.
-
----
-
-## API Reference
-
-### REST API — `/api/*`
-
-All `/api/*` endpoints require HTTPS and Bearer token authentication:
-
-```bash
-curl -H "Authorization: Bearer <token>" http://localhost:8765/api/messages
-```
-
-The token is shown on the Settings page and stored in `PGP_DIR/.auth_token`.
 
 #### `POST /api/messages`
 
-Encrypt and store a new message. Stores in SQLite DB and writes `.asc` file to disk.
+Encrypt and store a new message.
 
 ```bash
-curl -X POST http://localhost:8765/api/messages \
+curl -X POST https://localhost:8765/api/messages \
+  -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"recipient": "friend@example.com", "plaintext": "Hello!", "subject": "Hi"}'
 ```
 
-**Response:**
-```json
-{
-  "id": 106,
-  "timestamp": "2026-03-30T12:00:00.000Z",
-  "recipient": "friend@example.com",
-  "subject": "Hi",
-  "file": "reply106.asc",
-  "content_hash": "a1b2c3..."
-}
-```
-
 #### `GET /api/messages`
 
-List messages with optional filters. Returns message metadata (not plaintext).
-
-```bash
-# All messages, most recent first
-curl "http://localhost:8765/api/messages"
-
-# Filter by recipient
-curl "http://localhost:8765/api/messages?recipient=friend@example.com"
-
-# Messages since a date
-curl "http://localhost:8765/api/messages?since=2026-03-01"
-
-# Pagination
-curl "http://localhost:8765/api/messages?limit=20&offset=40"
-```
-
-**Response:**
-```json
-[
-  {
-    "id": 106,
-    "timestamp": "2026-03-30T12:00:00",
-    "sender": "you@yourdomain.com",
-    "sender_username": "alice",
-    "recipient": "friend@example.com",
-    "subject": "Hi",
-    "file_path": "users/alice/sent/reply106.asc",
-    "content_hash": "a1b2c3..."
-  }
-]
-```
+List messages. Supports `?recipient=`, `?since=`, `?limit=`, `?offset=`.
 
 #### `GET /api/messages/<id>`
 
 Decrypt and return a single message by ID.
 
-```bash
-curl "http://localhost:8765/api/messages/106"
-```
-
-**Response:**
-```json
-{
-  "id": 106,
-  "timestamp": "2026-03-30T12:00:00",
-  "sender": "you@yourdomain.com",
-  "recipient": "friend@example.com",
-  "subject": "Hi",
-  "plaintext": "Hello!",
-  "content_hash": "a1b2c3..."
-}
-```
-
 #### `DELETE /api/messages/<id>`
 
-Delete a message from both SQLite DB AND the `.asc` file on disk.
+Delete a message from DB and disk.
 
-```bash
-curl -X DELETE "http://localhost:8765/api/messages/106"
-```
-
-#### `PATCH /api/messages/<id>`
+#### `PATCH /api/messages/<id>/read`
 
 Mark a message as read.
 
-```bash
-curl -X PATCH "http://localhost:8765/api/messages/106" \
-  -H "Content-Type: application/json" \
-  -d '{"read": true}'
-```
-
 #### `POST /api/wipe`
 
-**Kill GPG agent, wipe all messages from DB, delete all `.asc` files in `PGP_DIR`.** Irreversible.
-
-```bash
-curl -X POST "http://localhost:8765/api/wipe" \
-  -H "Content-Type: application/json" \
-  -d '{"confirm": "yes"}'
-```
-
----
-
-### Web UI — `POST /compose`
-
-Encrypt or decrypt a message.
-
-**Encrypt:**
-```
-POST /compose
-Content-Type: application/x-www-form-urlencoded
-
-action=encrypt
-message=Hello world
-recipient=friend@email.com
-subject=Greeting          # optional
-```
-
-**Decrypt:**
-```
-POST /compose
-Content-Type: application/x-www-form-urlencoded
-
-action=decrypt
-ciphertext=-----BEGIN PGP MESSAGE-----...
-local_user=you@email.com    # optional — auto-detected if omitted
-```
-
-### `GET /keys`
-View all public keys in your keyring.
-
-### `POST /keys`
-Import or delete public keys.
-
-**Import:**
-```
-POST /keys
-action=import
-key_data=-----BEGIN PGP PUBLIC KEY BLOCK-----...
-```
-
-**Delete:**
-```
-POST /keys
-action=delete
-key_id=ABC123DEF456
-```
-
----
+Kill GPG agent, wipe all messages and DB. Requires `{"confirm": "yes"}` and admin session.
 
 ### Web UI Routes
 
@@ -568,53 +263,187 @@ key_id=ABC123DEF456
 | `/login` | GET, POST | Login page |
 | `/logout` | POST | Logout and clear session |
 | `/compose` | GET, POST | Encrypt or decrypt messages |
-| `/inbox` | GET | View all messages (lazy decrypt — click to reveal) |
+| `/inbox` | GET | View received messages (lazy decrypt) |
 | `/inbox/decrypt_file/<filename>` | GET | Decrypt a file inline (AJAX) |
 | `/inbox/raw/<filename>` | GET | Serve raw `.asc` file content |
-| `/inbox/delete_file/<filename>` | DELETE | Delete a disk-scanned `.asc` file |
+| `/inbox/delete_file/<filename>` | POST | Delete a `.asc` file from inbox/sent |
 | `/sent` | GET | View sent messages |
-| `/keys` | GET, POST | Key management — list, import, delete public keys |
-| `/settings` | GET, POST | Settings — GPG homedir, confirmation guard, dark mode |
-| `/settings/ca-cert` | GET | Download CA certificate for client devices |
-| `/settings/regen-token` | POST | Regenerate API auth token |
-| `/settings/kill-agent` | GET | Kill gpg-agent, clear passphrase cache |
-| `/admin/users` | GET, POST | Admin — create, delete users, reset passwords |
-| `/admin/audit` | GET | Admin — view failed login attempts |
-| `/admin/unlock` | POST | Admin — unlock locked IPs/usernames |
-| `/toggle-dark` | POST | Toggle dark mode (cookie-based) |
-| `/api/messages` | GET, POST | REST API — list or create messages |
-| `/api/messages/<id>` | GET, DELETE, PATCH | REST API — decrypt, delete, or mark-read |
-| `/api/wipe` | POST | Kill GPG agent, wipe DB, delete all `.asc` files |
-| `/health` | GET | Health check endpoint |
+| `/sent/clear` | POST | Clear the sent log (admin only) |
+| `/keys` | GET, POST | List, import, or delete public keys |
+| `/settings` | GET, POST | Confirmation guard, dark mode, environment info |
+| `/settings/ca-cert` | GET | Download CA certificate |
+| `/settings/regen-token` | POST | Regenerate API auth token (admin only) |
+| `/settings/kill-agent` | POST | Kill gpg-agent and clear passphrase cache |
+| `/admin/users` | GET, POST | Create, delete users, reset passwords |
+| `/admin/audit` | GET | View failed login attempts |
+| `/admin/unlock` | POST | Unlock locked IPs/usernames |
+| `/toggle-dark` | POST | Toggle dark mode |
+
+---
+
+## Security Features
+
+### Confirmation Guard
+
+The **Settings → Confirmation Guard** adds a passphrase prompt before encrypt/decrypt operations. Useful on shared machines.
+
+### GPG Agent
+
+The GPG Agent (`gpg-agent`) caches your private key passphrase in memory. PGP Vault manages the passphrase automatically — each user's key is protected with a random 64-character passphrase stored in `users/{username}/.gpg_passphrase` (file permissions `0600`).
+
+To manually manage the agent:
+
+```bash
+gpgconf --kill gpg-agent    # stop the agent
+gpg-agent --daemon           # start fresh
+```
+
+The **Settings → Kill Agent** button in the web UI does the same thing.
+
+### Clipboard Auto-Clear
+
+Decrypted plaintext is copied to clipboard and auto-clears after 30 seconds (configurable via `PGP_CLIPBOARD_CLEAR_SECONDS`).
+
+### Login Lockout
+
+5 failed login attempts per IP triggers a 15-minute lockout. Admins can unlock from **Admin → Audit**.
+
+---
+
+## File Layout
+
+```
+echo-pgp-webui/
+├── pgp_webui.py              # Flask application
+├── requirements-server.txt   # pip install -r requirements-server.txt
+├── README.md
+├── LICENSE
+└── .gitignore
+
+PGP_DIR/                      # set via PGP_DIR env var (default: script's parent directory)
+├── sessions.db               # SQLite — users, sessions, login attempts
+├── .auth_token               # Bearer token for API access
+├── pgpvault.crt              # TLS server certificate (auto-generated)
+├── pgpvault.key              # TLS server private key
+├── pgpvault-ca.crt           # TLS CA certificate
+├── pgpvault-ca.key            # TLS CA private key
+└── users/
+    └── {username}/
+        ├── .gnupg/           # per-user GPG homedir (private keys isolated)
+        ├── .gpg_passphrase   # per-user key passphrase (0600 permissions)
+        ├── messages.db       # per-user SQLite — message metadata + encrypted payloads
+        ├── pubkey.asc        # user's exported public key
+        ├── inbox/            # received .asc files
+        └── sent/             # sent .asc files
+```
 
 ---
 
 ## Troubleshooting
 
-### `gpg: error:哽嚥踝: no such user ID` — Recipient not found
+### `gpg: error: no such user ID` — Recipient not found
+
 You haven't imported your friend's public key yet. Go to **Keys → Import a Friend's Public Key** and paste their `.asc` block.
 
-### `gpg: keyserver receive failed: No data` — Key import failed
+### `gpg: keyserver receive failed: No data`
+
 The key block may be malformed. Make sure you copied the full `-----BEGIN PGP PUBLIC KEY BLOCK-----` through `-----END PGP PUBLIC KEY BLOCK-----` lines.
 
 ### `FileNotFoundError: [WinError 2] The system cannot find the file specified`
-GPG isn't in your system PATH. This is fixed in the latest version by auto-detecting the GPG binary. Make sure you're running the [latest release](https://github.com/Echo-Computing/echo-pgp-webui/releases).
+
+GPG isn't in your system PATH. This is auto-detected in the latest version — make sure you're running the [latest release](https://github.com/Echo-Computing/echo-pgp-webui/releases).
 
 ### GPG asks for passphrase on every operation
-The GPG agent is caching the passphrase for a limited time. Use `gpgconf --kill gpg-agent` to restart it, or set `default-cache-ttl 86400` in your `gpg.conf` for 24-hour caching.
+
+PGP Vault manages passphrases automatically via `--pinentry-mode loopback`. If you see passphrase prompts, make sure you're on v2.2.0+ which handles this automatically.
 
 ---
 
 ## Production Deployment
 
-**Do not** use Flask's built-in dev server (`python pgp_webui.py`) in production. Use a WSGI server:
+### Option 1: Gunicorn (recommended)
 
 ```bash
 pip install gunicorn
-gunicorn -w 2 -b 0.0.0.0:8765 pgp_webui:app
+gunicorn --workers 2 --bind 0.0.0.0:8765 --keyfile PGP_DIR/pgpvault.key --certfile PGP_DIR/pgpvault.crt pgp_webui:app
 ```
 
-Or behind a reverse proxy (nginx/Caddy) with HTTPS.
+### Option 2: Nginx Reverse Proxy
+
+```nginx
+server {
+    listen 443 ssl;
+    server_name pgpvault.example.com;
+
+    ssl_certificate     /path/to/pgpvault-ca.crt;
+    ssl_certificate_key /path/to/pgpvault.key;
+
+    location / {
+        proxy_pass http://127.0.0.1:8765;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+}
+```
+
+When running behind a reverse proxy, add ProxyFix to `pgp_webui.py`:
+
+```python
+from werkzeug.middleware.proxy_fix import ProxyFix
+app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1)
+```
+
+### Option 3: systemd Service (Linux)
+
+```ini
+[Unit]
+Description=PGP Vault Web UI
+After=network.target
+
+[Service]
+Type=simple
+User=pgpvault
+WorkingDirectory=/opt/echo-pgp-webui
+ExecStart=/opt/echo-pgp-webui/venv/bin/gunicorn --workers 2 --bind 0.0.0.0:8765 pgp_webui:app
+Restart=on-failure
+Environment=PGP_DIR=/opt/pgpvault-data
+
+[Install]
+WantedBy=multi-user.target
+```
+
+### Option 4: Docker
+
+```dockerfile
+FROM python:3.12-slim
+RUN apt-get update && apt-get install -y gnupg && rm -rf /var/lib/apt/lists/*
+WORKDIR /app
+COPY requirements-server.txt .
+RUN pip install --no-cache-dir -r requirements-server.txt gunicorn
+COPY pgp_webui.py .
+EXPOSE 8765
+ENV PGP_DIR=/data
+VOLUME /data
+CMD ["gunicorn", "--workers", "2", "--bind", "0.0.0.0:8765", "pgp_webui:app"]
+```
+
+```bash
+docker build -t pgpvault .
+docker run -d -p 8765:8765 -v /path/to/pgp-data:/data pgpvault
+```
+
+### Accessing from Other Devices on Your LAN
+
+1. Find your server's LAN IP (shown on startup, or `ip addr` / `ifconfig`)
+2. Install the CA certificate (`PGP_DIR/pgpvault-ca.crt`) on client devices:
+   - **Windows:** Double-click the `.crt` → Install Certificate → Local Machine → Trusted Root CA
+   - **macOS:** Double-click → Add to Keychain → set to "Always Trust"
+   - **Linux:** `sudo cp pgpvault-ca.crt /usr/local/share/ca-certificates/ && sudo update-ca-certificates`
+   - **Android:** Settings → Security → Install from storage
+   - **iOS:** Open the `.crt` in Safari → Install Profile
+3. Open `https://YOUR-LAN-IP:8765` on the client device
 
 ---
 
@@ -622,14 +451,19 @@ Or behind a reverse proxy (nginx/Caddy) with HTTPS.
 
 | Concern | Mitigation |
 |---------|-----------|
-| Auth token sent over HTTPS | TLS encryption protects the token in transit |
-| Auth token stored on client device | Store in secure enclave / app-private storage |
-| CA cert installed on client devices | Only install from a server you control |
-| Secret keys on server only | Private keys never leave the GPG keyring |
-| Message content in SQLite | Encrypted payload — ciphertext only, not plaintext |
-| Path traversal attacks | Usernames validated with regex, filenames stripped with `Path.name` |
-| SQL injection | All DB operations use parameterized queries |
+| CSRF attacks | Double-submit cookie pattern on all POST routes |
+| XSS attacks | `html.escape()` on all user input in HTML responses |
+| SQL injection | Parameterized queries throughout |
 | Brute force login | 5 failed attempts per IP → 15-minute lockout |
+| Path traversal | `Path(filename).name` strips directory components |
+| GPG injection | List-form subprocess args, regex-validated usernames/emails |
+| Key passphrase leakage | `--passphrase-file` with temp files (never on command line) |
+| Secret key exposure | Per-user `users/{username}/.gnupg/` isolation |
+| Message tampering | SHA-256 content hashes stored with each message |
+| Auth token timing attacks | `secrets.compare_digest()` instead of `==` |
+| Session hijacking | HttpOnly + Secure + SameSite=Lax cookies, 7-day expiry |
+| Stack trace leakage | Generic error messages, GPG errors logged server-side only |
+| CORS | Restricted to `PGP_CORS_ORIGINS` env var (empty by default) |
 
 ---
 

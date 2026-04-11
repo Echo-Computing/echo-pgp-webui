@@ -1318,6 +1318,17 @@ td code { font-size: 0.85rem; }
 .card:nth-child(3) { animation-delay: 0.10s; }
 .card:nth-child(4) { animation-delay: 0.15s; }
 .card:nth-child(5) { animation-delay: 0.20s; }
+@media (max-width: 768px) {
+  .container { padding: 1rem 0.5rem; }
+  header { padding: 0.75rem 1rem; flex-direction: column; align-items: flex-start; }
+  .header-right { width: 100%; }
+  .links { margin-top: 0.5rem; display: flex; flex-wrap: wrap; gap: 0.25rem; }
+  .grid2 { flex-direction: column; }
+  .grid2 > .card { flex: 1 1 100%; }
+  table { display: block; overflow-x: auto; white-space: nowrap; }
+  .login-box { width: 95%; padding: 1.5rem; }
+  input, select, textarea { font-size: 16px; }
+}
 """
 
 LIGHT_CSS = """
@@ -1381,6 +1392,17 @@ td { padding: 0.5rem; border-bottom: 1px solid #d0d7de; }
 td.col-actions { white-space: nowrap; overflow: visible; }
 td.col-fprint { font-family: 'Courier New', Courier, monospace; font-size: 0.78rem; color: #57606a; }
 td code { font-size: 0.85rem; }
+@media (max-width: 768px) {
+  .container { padding: 1rem 0.5rem; }
+  header { padding: 0.75rem 1rem; flex-direction: column; align-items: flex-start; }
+  .header-right { width: 100%; }
+  .links { margin-top: 0.5rem; display: flex; flex-wrap: wrap; gap: 0.25rem; }
+  .grid2 { flex-direction: column; }
+  .grid2 > .card { flex: 1 1 100%; }
+  table { display: block; overflow-x: auto; white-space: nowrap; }
+  .login-box { width: 95%; padding: 1.5rem; }
+  input, select, textarea { font-size: 16px; }
+}
 """
 
 BASE_TEMPLATE = """
@@ -1388,6 +1410,7 @@ BASE_TEMPLATE = """
 <html>
 <head>
   <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>{{ title }} — PGP Vault</title>
   <style id="theme-css">
     * { box-sizing: border-box; margin: 0; padding: 0; }
@@ -1754,13 +1777,13 @@ def inbox():
 
     body = f'''
     <style>
-    .decrypted-content {{ background:#0d1117; border:1px solid #30363d; border-radius:6px; padding:1rem; margin-top:0.5rem; white-space:pre-wrap; word-break:break-all; max-height:400px; overflow-y:auto; font-size:0.85rem; }}
+    .decrypted-content {{ background:var(--bg-primary,#0d1117); border:1px solid var(--border,#30363d); border-radius:6px; padding:1rem; margin-top:0.5rem; white-space:pre-wrap; word-break:break-all; max-height:400px; overflow-y:auto; font-size:0.85rem; color:var(--text,#e6edf3); }}
     table {{ width:100%; border-collapse:collapse; }}
-    .decrypted-row td {{ padding:0.5rem 1rem 1rem; background:#161b22; }}
+    .decrypted-row td {{ padding:0.5rem 1rem 1rem; background:var(--card-bg,#161b22); }}
     .search-row {{ margin-bottom:0.75rem; }}
-    .search-row input {{ padding:0.4rem 0.6rem; border-radius:4px; border:1px solid #30363d; background:#0d1117; color:#e6edf3; width:100%; box-sizing:border-box; font-size:0.9rem; }}
-    .search-row input::placeholder {{ color:#8b949e; }}
-    .search-row input:focus {{ outline:1px solid #58a6ff; border-color:#58a6ff; }}
+    .search-row input {{ padding:0.4rem 0.6rem; border-radius:4px; border:1px solid var(--border,#30363d); background:var(--bg-primary,#0d1117); color:var(--text,#e6edf3); width:100%; box-sizing:border-box; font-size:0.9rem; }}
+    .search-row input::placeholder {{ color:var(--muted,#8b949e); }}
+    .search-row input:focus {{ outline:1px solid var(--accent,#58a6ff); border-color:var(--accent,#58a6ff); }}
     </style>
     {f'<div class="alert info">{len(messages)} messages — lazy decrypt: click to reveal</div>' if messages else f'<div class="alert info">No messages found</div>'}
     <div class="card"><h2>Inbox</h2>
